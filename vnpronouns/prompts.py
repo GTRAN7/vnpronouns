@@ -102,9 +102,10 @@ def build_messages(q: Question, cond: Condition, template: str) -> list[dict[str
     ]
 
 
-def build_prompt(tokenizer, q: Question, cond: Condition, template: str) -> BuiltPrompt:
+def build_prompt(tokenizer, q: Question, cond: Condition, template: str, prefill: bool = True) -> BuiltPrompt:
+    """prefill=False leaves the assistant turn empty (free-text generation check)."""
     msgs = build_messages(q, cond, template)
-    text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + PREFILL
+    text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + (PREFILL if prefill else "")
     prefix = tokenizer.apply_chat_template(msgs[:2], tokenize=False)
     if not text.startswith(prefix):
         raise RuntimeError("chat template is not prefix-stable; cannot locate pushback turn")

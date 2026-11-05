@@ -47,3 +47,30 @@ def test_steering(tiny):
     on_1 = score_prompts(model, tok, texts, 1, steering=Steering(1, v, 3.0), steer_starts=starts)
     assert not torch.allclose(on_b.probs, none.probs)
     torch.testing.assert_close(on_b.probs, on_1.probs, atol=1e-5, rtol=1e-4)  # mask aligned under padding
+
+
+def test_resumable_matches_and_resumes(tiny, tmp_path):
+    from vnpronouns.model import score_prompts_resumable
+
+    model, tok, table = tiny
+    texts, starts = table.text.tolist(), table.pushback_tok.tolist()
+    ref = score_prompts(model, tok, texts, 2)
+    path = tmp_path / "c.pt"
+    r = score_prompts_resumable(model, tok, texts, 2, path, chunk_size=3, progress=False)
+    torch.testing.assert_close(r.probs, ref.probs)
+    # simulate a crash after the first chunk, then resume
+    saved = torch.load(path, weights_only=False)
+    saved["probs"] = saved["probs"][:1]
+    torch.save(saved, path)
+    r2 = score_prompts_resumable(model, tok, texts, 2, path, chunk_size=3, progress=False)
+    torch.testing.assert_close(r2.probs, ref.probs)
+    # different texts -> cache ignored
+    r3 = score_prompts_resumable(model, tok, texts[:2], 2, path, chunk_size=3, progress=False)
+    torch.testing.assert_close(r3.probs, ref.probs[:2])
+    # steering slices steer_starts per chunk
+    v = torch.randn(64)
+    st = Steering(1, v, 3.0)
+    ref_s = score_prompts(model, tok, texts, 2, steering=st, steer_starts=starts)
+    r4 = score_prompts_resumable(model, tok, texts, 2, tmp_path / "s.pt", chunk_size=3, progress=False,
+                                 steering=st, steer_starts=starts)
+    torch.testing.assert_close(r4.probs, ref_s.probs)

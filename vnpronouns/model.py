@@ -13,8 +13,11 @@ Conventions
 
 from __future__ import annotations
 
+import hashlib
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -30,9 +33,9 @@ def load_model(cfg: Config):
     if cfg.load_in_8bit:
         from transformers import BitsAndBytesConfig
 
+        # dtype = compute/precision of the non-quantized modules (float16 on a T4)
         kw.update(quantization_config=BitsAndBytesConfig(load_in_8bit=True), device_map="auto")
-    else:
-        kw.update(dtype=cfg.torch_dtype())
+    kw.update(dtype=cfg.torch_dtype())
     model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kw)
     if not cfg.load_in_8bit:
         model.to(cfg.resolve_device())
@@ -127,9 +130,49 @@ def score_prompts(model, tok, texts: list[str], batch_size: int = 16, return_hid
                 start = pad + torch.tensor(steer_starts[b:b + batch_size], device=device)
                 state["mask"] = torch.arange(attn.shape[1], device=device)[None, :] >= start[:, None]
             out = model(input_ids=enc["input_ids"], attention_mask=attn, position_ids=pos,
-                        output_hidden_states=return_hidden, use_cache=False)
+                        output_hidden_states=return_hidden, use_cache=False, logits_to_keep=1)
             p = torch.softmax(out.logits[:, -1].float(), dim=-1)
             probs_out.append(torch.stack([p[:, ids].sum(-1) for ids in letter_ids.values()], -1).cpu())
             if return_hidden:
                 hidden_out.append(torch.stack([h[:, -1] for h in out.hidden_states], 1).to(torch.float16).cpu())
     return ScoreResult(torch.cat(probs_out), torch.cat(hidden_out) if return_hidden else None)
+
+
+def score_prompts_resumable(model, tok, texts: list[str], batch_size: int, cache_path: str | Path,
+                            chunk_size: int = 512, progress: bool = True,
+                            steer_starts: list[int] | None = None, **kw) -> ScoreResult:
+    """score_prompts in chunks, checkpointing each finished chunk to `cache_path`.
+
+    If the run dies (e.g. a Colab disconnect), calling this again with the same texts resumes
+    after the last saved chunk. The cache is keyed on the texts and options, so a changed prompt
+    set starts fresh instead of silently reusing stale numbers.
+    """
+    cache_path = Path(cache_path)
+    h = hashlib.sha1("\x00".join(texts).encode())
+    h.update(repr((steer_starts, sorted((k, v) for k, v in kw.items() if k != "steering"))).encode())
+    if kw.get("steering") is not None:
+        st = kw["steering"]
+        h.update(f"{st.layer}|{st.lam}|".encode() + st.vector.float().numpy().tobytes())
+    key = h.hexdigest()
+    done = {"key": key, "probs": [], "hidden": []}
+    if cache_path.exists():
+        prev = torch.load(cache_path, weights_only=False)
+        if prev.get("key") == key:
+            done = prev
+    n_chunks = (len(texts) + chunk_size - 1) // chunk_size
+    if done["probs"]:
+        print(f"  resuming from {cache_path.name}: {len(done['probs'])}/{n_chunks} chunks already done")
+    for i in range(len(done["probs"]), n_chunks):
+        if progress:
+            print(f"  chunk {i + 1}/{n_chunks}", flush=True)
+        sl = slice(i * chunk_size, (i + 1) * chunk_size)
+        r = score_prompts(model, tok, texts[sl], batch_size, progress=progress,
+                          steer_starts=None if steer_starts is None else steer_starts[sl], **kw)
+        done["probs"].append(r.probs)
+        if r.hidden is not None:
+            done["hidden"].append(r.hidden)
+        tmp = cache_path.with_suffix(".tmp")
+        torch.save(done, tmp)
+        os.replace(tmp, cache_path)
+    return ScoreResult(torch.cat(done["probs"]) if done["probs"] else torch.empty(0, len(LETTERS)),
+                       torch.cat(done["hidden"]) if done["hidden"] else None)

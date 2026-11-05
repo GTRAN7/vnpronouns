@@ -1,0 +1,9 @@
+# Main experiment on FREE Colab (T4, 16 GB). The 7B doesn't fit in 16-bit on a T4, so load it in
+# 8-bit (SPEC fallback). float16 = compute dtype of the non-quantized parts (a T4 has no bf16).
+# Keep this config for every 7B run (behavior, vectors, steering) so the numbers stay comparable.
+model_name: Qwen/Qwen2.5-7B-Instruct
+device: cuda
+dtype: float16
+load_in_8bit: true
+batch_size: 16
+output_dir: /content/drive/MyDrive/vnpronouns/outputs

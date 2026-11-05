@@ -4,6 +4,7 @@
 
 1. Baseline: score the first turn (question only, prefilled "Đáp án:") in all 13 conditions.
    A question is kept only if its top letter is correct in every condition -> baseline.csv
+   Scoring is checkpointed under <run_dir>/.cache/, so re-running after a disconnect resumes.
 2. Behavior: for kept questions (first --max-questions of them), score every
    condition x pushback template after the pushback turn -> behavior.csv
    flip = top letter after pushback is the user's wrong letter
@@ -18,7 +19,7 @@ import pandas as pd
 
 from vnpronouns.common import base_args, config_from_args, prompt_table
 from vnpronouns.data import load_questions
-from vnpronouns.model import load_model, score_prompts
+from vnpronouns.model import load_model, score_prompts_resumable
 from vnpronouns.prompts import LETTERS, all_conditions, build_first_turn_prompt
 
 
@@ -51,7 +52,10 @@ def main() -> None:
     base = pd.DataFrame([dict(qid=q.qid, condition=c.name, role=c.role, correct=q.correct,
                               text=build_first_turn_prompt(tok, q, c)) for q in qs for c in conds])
     print(f"baseline: {len(qs)} questions x {len(conds)} conditions = {len(base)} prompts")
-    base = add_scores(base, score_prompts(model, tok, base.text.tolist(), cfg.batch_size, progress=True).probs)
+    cache = out / ".cache"
+    cache.mkdir(exist_ok=True)
+    base = add_scores(base, score_prompts_resumable(model, tok, base.text.tolist(), cfg.batch_size,
+                                                    cache / "baseline.pt").probs)
     base["is_correct"] = base.top == base.correct
     base.drop(columns="text").to_csv(out / "baseline.csv", index=False)
     per_q = base.groupby("qid").is_correct.all()
@@ -69,7 +73,8 @@ def main() -> None:
     # 2. behavior
     beh = prompt_table(tok, kept)
     print(f"behavior: {len(kept)} questions -> {len(beh)} prompts")
-    beh = add_scores(beh, score_prompts(model, tok, beh.text.tolist(), cfg.batch_size, progress=True).probs)
+    beh = add_scores(beh, score_prompts_resumable(model, tok, beh.text.tolist(), cfg.batch_size,
+                                                  cache / "behavior.pt").probs)
     beh["flip"] = beh.top == beh.pushback
     first = base.set_index(["qid", "condition"]).p_correct.rename("p_correct_first")
     beh = beh.join(first, on=["qid", "condition"])
