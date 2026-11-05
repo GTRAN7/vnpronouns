@@ -20,8 +20,11 @@ and both answer texts, for reading by hand).
 
 from __future__ import annotations
 
+import hashlib
+import os
 import random
 import re
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -29,7 +32,8 @@ import torch
 from vnpronouns.common import base_args, config_from_args
 from vnpronouns.data import load_questions, nfc
 from vnpronouns.model import load_model
-from vnpronouns.prompts import LETTERS, PUSHBACK_TEMPLATES, all_conditions, build_prompt
+from vnpronouns.prompts import LETTERS, PUSHBACK_TEMPLATES, TEMPLATE_FAMILY, all_conditions, build_prompt
+from vnpronouns.stats import boot_weights, paired_tests
 
 _WORD = r"0-9A-Za-zÀ-ỹĐđ"
 # "Đáp án đúng là: B", "câu trả lời chính xác là B)", "đáp án: B"
@@ -78,18 +82,34 @@ def has_word(text: str, word: str) -> bool:
 
 
 @torch.no_grad()
-def generate(model, tok, texts: list[str], batch_size: int, max_new_tokens: int) -> list[str]:
+def generate(model, tok, texts: list[str], batch_size: int, max_new_tokens: int,
+             cache_path: Path | None = None, chunk_size: int = 512) -> list[str]:
+    """Greedy replies. With cache_path, finished chunks are checkpointed and a re-run resumes."""
     from tqdm.auto import tqdm
 
+    key = hashlib.sha1(("\x00".join(texts) + f"|{max_new_tokens}").encode()).hexdigest()
+    done: list[str] = []
+    if cache_path is not None and cache_path.exists():
+        prev = torch.load(cache_path, weights_only=False)
+        if prev.get("key") == key:
+            done = prev["replies"]
+            print(f"  resuming: {len(done)}/{len(texts)} replies already generated")
     device = next(model.parameters()).device
-    out = []
-    for b in tqdm(range(0, len(texts), batch_size), leave=False):
-        enc = tok(texts[b:b + batch_size], return_tensors="pt", padding=True,
-                  add_special_tokens=False).to(device)
-        gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                             temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
-        out += tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-    return [o.strip() for o in out]
+    for c in range(len(done), len(texts), chunk_size):
+        print(f"  chunk {c // chunk_size + 1}/{(len(texts) + chunk_size - 1) // chunk_size}", flush=True)
+        chunk = texts[c:c + chunk_size]
+        for b in tqdm(range(0, len(chunk), batch_size), leave=False):
+            enc = tok(chunk[b:b + batch_size], return_tensors="pt", padding=True,
+                      add_special_tokens=False).to(device)
+            gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                                 temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
+            done += [o.strip() for o in
+                     tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)]
+        if cache_path is not None:
+            tmp = cache_path.with_suffix(".tmp")
+            torch.save({"key": key, "replies": done}, tmp)
+            os.replace(tmp, cache_path)
+    return done
 
 
 def analyze(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,13 +142,24 @@ def report(df: pd.DataFrame) -> None:
     print("\n  flip rate, letter metric vs free reply, by template x role (readable only):")
     t = r.groupby(["template", "role"])[["metric_flip", "reply_flip", "flip_agree"]].mean().round(3)
     t["n"] = r.groupby(["template", "role"]).size()
-    print(t.to_string())
+    print(t.unstack("role").to_string())
     print("\n  flip rate by role, all templates (readable only):")
     print(r.groupby("role")[["metric_flip", "reply_flip"]].mean().round(3).to_string())
     print("\n  pronoun mirroring (exploratory): share of replies that use ...")
     m = df.groupby("role")[["addr_user_pron", "self_model_pron", "says_ban"]].mean().round(3)
     m.columns = ["user's pronoun", "model's own pronoun", "'bạn'"]
     print(m.to_string())
+    # role effects in what the model actually writes (unclear replies count as no flip)
+    ff = df.assign(flip=df.reply_flip, pair=df.condition.str.rsplit("_", n=1).str[0].where(df.role != "neutral", "neutral"),
+                   family=df.template.map(TEMPLATE_FAMILY))
+    qids = pd.Index(sorted(ff.qid.unique()))
+    W = boot_weights(len(qids), 5000, 0)
+    groups = [("all", ff)] + list(ff.groupby("family")) + list(ff.groupby("template"))
+    print("\n  FREE-REPLY role effects (McNemar uncorrected; bootstrap over questions):")
+    for name, sub in groups:
+        for t in pd.DataFrame(paired_tests(sub, W, qids, scope=str(name), n_comparisons=1)).itertuples():
+            print(f"  {t.scope:11s} {t.comparison:18s} {t.flip_x:.3f} vs {t.flip_y:.3f}  discordant {t.x_only}/{t.y_only}  "
+                  f"McNemar p={t.mcnemar_p:.2g}  diff {t.flip_diff:+.3f} [{t.diff_ci_lo:+.3f}, {t.diff_ci_hi:+.3f}]")
     dis = r[~r.flip_agree]
     if len(dis):
         print(f"\n  flip disagreements ({len(dis)}), 6 random:")
@@ -167,7 +198,10 @@ def main() -> None:
                                      text=build_prompt(tok, q, c, t, prefill=False).text))
         df = pd.DataFrame(rows)
         print(f"generating {len(df)} replies ({len(qs)} questions x 13 conditions x {len(args.templates)} templates)")
-        df["reply"] = generate(model, tok, df.text.tolist(), cfg.batch_size, args.max_new_tokens)
+        cache = out / ".cache"
+        cache.mkdir(exist_ok=True)
+        df["reply"] = generate(model, tok, df.text.tolist(), cfg.batch_size, args.max_new_tokens,
+                               cache_path=cache / "freetext.pt")
         df = df.drop(columns="text").merge(
             beh[["qid", "condition", "template", "top"]].rename(columns={"top": "metric_letter"}),
             on=["qid", "condition", "template"])

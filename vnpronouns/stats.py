@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from vnpronouns.common import base_args, config_from_args
+from vnpronouns.prompts import PRIMARY_TEMPLATES, TEMPLATE_FAMILY
 
 ROLES = ("senior", "junior", "neutral")
 COMPARISONS = (("senior", "junior"), ("senior", "neutral"), ("junior", "neutral"))
@@ -155,6 +156,39 @@ def template_analysis(df: pd.DataFrame, W: np.ndarray, qids: pd.Index):
     return pd.DataFrame(tests), pd.DataFrame(contrasts), pd.DataFrame(by_pair)
 
 
+def family_analysis(df: pd.DataFrame, W: np.ndarray, qids: pd.Index):
+    """Hedged vs blunt pushback families (all templates).
+
+    tests:       McNemar + bootstrap per comparison within each family (Bonferroni x6)
+    interaction: (x - y gap in hedged) - (same in blunt), bootstrap (Bonferroni x3)
+    per_tmpl:    each template's senior-junior / junior-neutral gaps, to see if a family is consistent
+    """
+    df = df.assign(family=df.template.map(TEMPLATE_FAMILY))
+    fams = ("hedged", "blunt")
+    tests, draws = [], {}
+    for f in fams:
+        sub = df[df.family == f]
+        tests += paired_tests(sub, W, qids, scope=f, n_comparisons=len(COMPARISONS) * len(fams))
+        for x, y in COMPARISONS:
+            draws[(x, y, f)] = diff_boots(sub[sub.role == x], sub[sub.role == y], "flip", W, qids)
+    inter = []
+    for x, y in COMPARISONS:
+        (p1, b1), (p2, b2) = draws[(x, y, "hedged")], draws[(x, y, "blunt")]
+        point, lo, hi, p = summarize_boots(p1 - p2, b1 - b2)
+        inter.append(dict(comparison=f"{x} vs {y}", gap_hedged=p1, gap_blunt=p2, interaction=point,
+                          ci_lo=lo, ci_hi=hi, boot_p=p, boot_p_bonf=min(1.0, p * len(COMPARISONS))))
+    per_tmpl = []
+    for t, sub in df.groupby("template"):
+        row = dict(template=t, family=TEMPLATE_FAMILY[t], primary=t in PRIMARY_TEMPLATES)
+        for role in ROLES:
+            row[f"flip_{role}"] = sub[sub.role == role].flip.mean()
+        for x, y in COMPARISONS:
+            point, lo, hi, p = diff_with_ci(sub[sub.role == x], sub[sub.role == y], "flip", W, qids)
+            row.update({f"{x[0]}-{y[0]}": point, f"{x[0]}-{y[0]}_lo": lo, f"{x[0]}-{y[0]}_hi": hi})
+        per_tmpl.append(row)
+    return pd.DataFrame(tests), pd.DataFrame(inter), pd.DataFrame(per_tmpl).sort_values(["family", "template"])
+
+
 def rate_rows(df: pd.DataFrame, W: np.ndarray, qids: pd.Index, by: str | None) -> list[dict]:
     rows = []
     groups = [("all", df)] if by is None else list(df.groupby(by))
@@ -177,9 +211,10 @@ def main() -> None:
     args = ap.parse_args()
     cfg = config_from_args(args)
     out = cfg.run_dir
-    df = pd.read_csv(out / "behavior.csv")
-    df["flip"] = df.flip.astype(bool)
-    df["gender"] = df.pair.map(GENDER).fillna("neutral")
+    df_all = pd.read_csv(out / "behavior.csv")
+    df_all["flip"] = df_all.flip.astype(bool)
+    df_all["gender"] = df_all.pair.map(GENDER).fillna("neutral")
+    df = df_all[df_all.template.isin(PRIMARY_TEMPLATES)]  # pre-registered templates
     qids = pd.Index(sorted(df.qid.unique()))
     W = boot_weights(len(qids), args.n_boot, cfg.seed)
 
@@ -198,7 +233,10 @@ def main() -> None:
     tests.to_csv(out / "stats_tests.csv", index=False)
 
     pd.set_option("display.width", 200)
-    print(f"{len(df)} prompts, {len(qids)} questions, {args.n_boot} bootstrap resamples over questions\n")
+    print(f"{len(df_all)} prompts, {len(qids)} questions, {df_all.template.nunique()} templates, "
+          f"{args.n_boot} bootstrap resamples over questions")
+    print(f"Sections up to the template x pair table use the pre-registered templates {PRIMARY_TEMPLATES} "
+          f"({len(df)} prompts)\n")
     ov = rates[(rates.breakdown == "overall")]
     for metric, title in (("flip", "FLIP RATE"), ("delta_p_correct", "MEAN DROP IN P(correct)")):
         t = ov[ov.metric == metric].set_index("role")
@@ -240,6 +278,27 @@ def main() -> None:
     tab = bp.assign(cell=bp.apply(lambda r: f"{r.senior_minus_junior:+.3f} [{r.ci_lo:+.2f},{r.ci_hi:+.2f}]", axis=1)) \
             .pivot(index="pair", columns="template", values="cell")
     print(tab.to_string())
+
+    if set(df_all.template) - set(PRIMARY_TEMPLATES):
+        ft, fi, fp = family_analysis(df_all, W, qids)
+        ft.to_csv(out / "stats_family_tests.csv", index=False)
+        fi.to_csv(out / "stats_family_interaction.csv", index=False)
+        fp.to_csv(out / "stats_family_by_template.csv", index=False)
+        print("\n===== ALL TEMPLATES: hedged vs blunt families =====")
+        print("PER-TEMPLATE flip rates and gaps [95% CI]  (s=senior, j=junior, n=neutral; * = pre-registered)")
+        for _, r in fp.iterrows():
+            gaps = "  ".join(f"{k} {r[k]:+.3f} [{r[k + '_lo']:+.2f},{r[k + '_hi']:+.2f}]" for k in ("s-j", "s-n", "j-n"))
+            print(f"  {r.family:6s} {r.template + ('*' if r.primary else ''):12s} "
+                  f"S {r.flip_senior:.3f} N {r.flip_neutral:.3f} J {r.flip_junior:.3f}   {gaps}")
+        print("\nWITHIN-FAMILY PAIRED TESTS (McNemar exact, Bonferroni x6; bootstrap over questions)")
+        for _, t in ft.iterrows():
+            print(f"  {t.scope:6s} {t.comparison:18s} {t.flip_x:.3f} vs {t.flip_y:.3f}  discordant {t.x_only}/{t.y_only}  "
+                  f"McNemar bonf p={t.mcnemar_p_bonf:.2g}  diff {t.flip_diff:+.3f} [{t.diff_ci_lo:+.3f}, {t.diff_ci_hi:+.3f}] "
+                  f"boot p={t.boot_p:.2g}")
+        print("\nFAMILY x ROLE INTERACTION: gap in hedged minus gap in blunt (Bonferroni x3)")
+        for _, c in fi.iterrows():
+            print(f"  {c.comparison:18s} {c.gap_hedged:+.3f} vs {c.gap_blunt:+.3f} -> {c.interaction:+.3f} "
+                  f"[{c.ci_lo:+.3f}, {c.ci_hi:+.3f}]  bonf p={c.boot_p_bonf:.2g}")
     print(f"\nwrote stats_rates.csv, stats_tests.csv, stats_template_tests.csv, "
           f"stats_template_interaction.csv, stats_template_by_pair.csv in {out}")
 
