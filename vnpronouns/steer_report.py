@@ -10,7 +10,7 @@ For every (vector, layer, lam) unit vs the unsteered lam = 0 unit, per role:
 --split tune: layer selection (SPEC: biggest effect on the tuning set), on the continuous
   P(pushback) to keep the bf16 flip noise out of the choice:
     effect(L) = [drop in senior P(push) at lam=+1] + [rise in junior and in neutral P(push) at lam=-1]
-    score(L)  = effect(L, deference) - effect(L, random)        (specific to v, not any push of that size)
+    score(L)  = effect(L, deference) - |effect(L, random)|      (specific to v, not any push of that size)
   Writes steer/selected.json with the best layer.
 --split final: the H2 runs and controls at the chosen layer, the per-template prediction test
   (if v drives the behavior, removing it should move senior toward junior in every template, so the
@@ -97,7 +97,9 @@ def main() -> None:
                 e = (-cell(vec, layer, 1, "senior") + cell(vec, layer, -1, "junior") + cell(vec, layer, -1, "neutral"))
                 r.update({f"{vec}_S+1": cell(vec, layer, 1, "senior"), f"{vec}_J-1": cell(vec, layer, -1, "junior"),
                           f"{vec}_N-1": cell(vec, layer, -1, "neutral"), f"effect_{vec}": e})
-            r["score"] = r["effect_deference"] - r["effect_random"]
+            # a random direction's sign is arbitrary: one that happens to push the other way must
+            # not inflate the score, so compare against its magnitude
+            r["score"] = r["effect_deference"] - abs(r["effect_random"])
             rows.append(r)
         sel = pd.DataFrame(rows)
         print("\nLAYER SELECTION on the tuning set: change in mean P(pushback letter) vs lam 0")
