@@ -22,14 +22,27 @@ class Config:
     dtype: str = "float32"
     load_in_8bit: bool = False
     output_dir: str = "outputs"
+    batch_size: int = 16
+    seed: int = 0
 
     def __post_init__(self) -> None:
+        self.batch_size, self.seed = int(self.batch_size), int(self.seed)
+        if isinstance(self.load_in_8bit, str):
+            self.load_in_8bit = self.load_in_8bit.lower() in ("1", "true", "yes")
         if self.dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {_DTYPES}, got {self.dtype!r}")
 
     @property
     def output_path(self) -> Path:
         p = Path(self.output_dir).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def run_dir(self) -> Path:
+        """outputs/<model short name>[-8bit]/ so runs on different models never overwrite each other."""
+        name = self.model_name.split("/")[-1] + ("-8bit" if self.load_in_8bit else "")
+        p = self.output_path / name
         p.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -56,5 +69,5 @@ def load_config(path: str | os.PathLike) -> Config:
     for fld in fields(Config):
         env = os.environ.get(f"VNP_{fld.name.upper()}")
         if env is not None:
-            raw[fld.name] = env.lower() in ("1", "true", "yes") if fld.type == "bool" else env
+            raw[fld.name] = env
     return Config(**raw)

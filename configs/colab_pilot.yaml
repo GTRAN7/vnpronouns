@@ -1,0 +1,7 @@
+# Phase 3 pilot on free Colab (T4): small model, same float32 as the local config.
+model_name: Qwen/Qwen2.5-0.5B-Instruct
+device: cuda
+dtype: float32
+load_in_8bit: false
+batch_size: 32
+output_dir: /content/drive/MyDrive/vnpronouns/outputs

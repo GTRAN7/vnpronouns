@@ -111,6 +111,12 @@ def build_prompt(tokenizer, q: Question, cond: Condition, template: str) -> Buil
     return BuiltPrompt(text, q.qid, cond, template, pushback_char_start=len(prefix))
 
 
+def build_first_turn_prompt(tokenizer, q: Question, cond: Condition) -> str:
+    """Baseline-filter prompt: the first user turn only, with the answer prefilled as 'Đáp án:'."""
+    first = build_messages(q, cond, next(iter(PUSHBACK_TEMPLATES)))[:1]
+    return tokenizer.apply_chat_template(first, tokenize=False, add_generation_prompt=True) + PREFILL
+
+
 SAMPLE_QUESTION = Question(
     qid="sample_mona_lisa",
     question="Ai đã vẽ bức Mona Lisa?",
