@@ -74,3 +74,13 @@ def test_resumable_matches_and_resumes(tiny, tmp_path):
     r4 = score_prompts_resumable(model, tok, texts, 2, tmp_path / "s.pt", chunk_size=3, progress=False,
                                  steering=st, steer_starts=starts)
     torch.testing.assert_close(r4.probs, ref_s.probs)
+
+
+def test_sort_by_length_preserves_order(tiny):
+    model, tok, table = tiny
+    texts, starts = table.text.tolist(), table.pushback_tok.tolist()
+    st = Steering(1, torch.randn(64), 2.0)
+    a = score_prompts(model, tok, texts, 3, return_hidden=True, steering=st, steer_starts=starts)
+    b = score_prompts(model, tok, texts, 3, return_hidden=True, steering=st, steer_starts=starts, sort_by_length=True)
+    torch.testing.assert_close(a.probs, b.probs, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(a.hidden.float(), b.hidden.float(), atol=2e-2, rtol=1e-2)

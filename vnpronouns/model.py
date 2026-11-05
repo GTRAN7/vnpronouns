@@ -105,13 +105,23 @@ def _steering_hook(model, steering: Steering | None, state: dict):
 @torch.no_grad()
 def score_prompts(model, tok, texts: list[str], batch_size: int = 16, return_hidden: bool = False,
                   steering: Steering | None = None, steer_starts: list[int] | None = None,
-                  progress: bool = False) -> ScoreResult:
+                  progress: bool = False, sort_by_length: bool = False) -> ScoreResult:
     """Next-token letter probabilities at the end of each prompt (and optionally last-token activations).
 
     steer_starts[i] = unpadded token index in texts[i] from which steering applies.
+    sort_by_length batches prompts of similar length together (less padding); outputs are
+    returned in the original order.
     """
     if steering is not None and steer_starts is None:
         raise ValueError("steer_starts is required with steering")
+    if sort_by_length and len(texts) > 1:
+        lens = [len(x) for x in tok(texts, add_special_tokens=False)["input_ids"]]
+        order = sorted(range(len(texts)), key=lambda i: -lens[i])
+        r = score_prompts(model, tok, [texts[i] for i in order], batch_size, return_hidden, steering,
+                          None if steer_starts is None else [steer_starts[i] for i in order], progress)
+        inv = torch.empty(len(order), dtype=torch.long)
+        inv[torch.tensor(order)] = torch.arange(len(order))
+        return ScoreResult(r.probs[inv], None if r.hidden is None else r.hidden[inv])
     device = next(model.parameters()).device
     letter_ids = letter_token_ids(tok)
     probs_out, hidden_out, state = [], [], {}
