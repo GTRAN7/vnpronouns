@@ -15,7 +15,12 @@ Paired tests (SPEC: senior vs junior, senior vs neutral, junior vs neutral):
   each comparison also gets a question-resampling bootstrap CI and p-value for the
   difference in flip rate. Treat the bootstrap as the check that McNemar is not overstating.
 
-Writes stats_rates.csv and stats_tests.csv next to behavior.csv.
+Template analysis: the same tests within each pushback template, the template x role
+interaction (does e.g. the senior-junior gap differ between soft and flat?), and the
+senior-junior gap per template x pair.
+
+Writes stats_rates.csv, stats_tests.csv, stats_template_tests.csv,
+stats_template_interaction.csv and stats_template_by_pair.csv next to behavior.csv.
 """
 
 from __future__ import annotations
@@ -66,17 +71,27 @@ def rate_with_ci(df: pd.DataFrame, col: str, W: np.ndarray, qids: pd.Index) -> t
     return point, lo, hi
 
 
-def diff_with_ci(a: pd.DataFrame, b: pd.DataFrame, col: str, W: np.ndarray, qids: pd.Index):
-    """Difference of rates a - b, bootstrap CI and two-sided bootstrap p (resampling questions)."""
+def diff_boots(a: pd.DataFrame, b: pd.DataFrame, col: str, W: np.ndarray, qids: pd.Index):
+    """Point estimate and bootstrap draws of rate(a) - rate(b). Shared W keeps draws comparable."""
     sa, na = _per_question(a, qids, col)
     sb, nb = _per_question(b, qids, col)
     point = sa.sum() / na.sum() - sb.sum() / nb.sum()
     with np.errstate(invalid="ignore", divide="ignore"):
         boots = (W @ sa) / (W @ na) - (W @ sb) / (W @ nb)
+    return point, boots
+
+
+def summarize_boots(point: float, boots: np.ndarray):
+    """(point, 95% CI lo, hi, two-sided bootstrap p) from bootstrap draws."""
     boots = boots[~np.isnan(boots)]
     lo, hi = np.percentile(boots, [2.5, 97.5])
     p = min(1.0, 2 * min((boots <= 0).mean(), (boots >= 0).mean()))
     return point, lo, hi, p
+
+
+def diff_with_ci(a: pd.DataFrame, b: pd.DataFrame, col: str, W: np.ndarray, qids: pd.Index):
+    """Difference of rates a - b, bootstrap CI and two-sided bootstrap p (resampling questions)."""
+    return summarize_boots(*diff_boots(a, b, col, W, qids))
 
 
 def matched_flips(df: pd.DataFrame, x: str, y: str) -> pd.DataFrame:
@@ -104,6 +119,40 @@ def paired_tests(df: pd.DataFrame, W: np.ndarray, qids: pd.Index, scope: str = "
                          x_only=b, y_only=c, mcnemar_p=p, mcnemar_p_bonf=min(1.0, p * n_comparisons),
                          flip_diff=d, diff_ci_lo=lo, diff_ci_hi=hi, boot_p=p_boot))
     return rows
+
+
+def template_analysis(df: pd.DataFrame, W: np.ndarray, qids: pd.Index):
+    """Role effects within each pushback template, and whether they differ between templates.
+
+    tests:     McNemar + bootstrap for each comparison within each template (Bonferroni x9).
+    contrasts: interaction = (x - y difference in template t1) - (same in t2), bootstrap over
+               questions with shared resamples (Bonferroni x9: 3 comparisons x 3 template pairs).
+    by_pair:   senior - junior difference per template x pair, to see if a pattern is pair-wide.
+    """
+    templates = sorted(df.template.unique())
+    n_tests = len(COMPARISONS) * len(templates)
+    tests, draws = [], {}
+    for t in templates:
+        sub = df[df.template == t]
+        for row in paired_tests(sub, W, qids, scope=t, n_comparisons=n_tests):
+            tests.append(row)
+        for x, y in COMPARISONS:
+            draws[(x, y, t)] = diff_boots(sub[sub.role == x], sub[sub.role == y], "flip", W, qids)
+    pairs_t = [(a, b) for i, a in enumerate(templates) for b in templates[i + 1:]]
+    n_con = len(COMPARISONS) * len(pairs_t)
+    contrasts = []
+    for x, y in COMPARISONS:
+        for t1, t2 in pairs_t:
+            (p1, b1), (p2, b2) = draws[(x, y, t1)], draws[(x, y, t2)]
+            point, lo, hi, p = summarize_boots(p1 - p2, b1 - b2)
+            contrasts.append(dict(comparison=f"{x} vs {y}", contrast=f"{t1} - {t2}", diff_t1=p1, diff_t2=p2,
+                                  interaction=point, ci_lo=lo, ci_hi=hi, boot_p=p,
+                                  boot_p_bonf=min(1.0, p * n_con)))
+    by_pair = []
+    for (t, pair), sub in df[df.role != "neutral"].groupby(["template", "pair"]):
+        point, lo, hi, p = diff_with_ci(sub[sub.role == "senior"], sub[sub.role == "junior"], "flip", W, qids)
+        by_pair.append(dict(template=t, pair=pair, senior_minus_junior=point, ci_lo=lo, ci_hi=hi, boot_p=p))
+    return pd.DataFrame(tests), pd.DataFrame(contrasts), pd.DataFrame(by_pair)
 
 
 def rate_rows(df: pd.DataFrame, W: np.ndarray, qids: pd.Index, by: str | None) -> list[dict]:
@@ -173,7 +222,26 @@ def main() -> None:
     for _, t in sj.iterrows():
         print(f"  {t.scope:9s} diff {t.flip_diff:+.3f} [{t.diff_ci_lo:+.3f}, {t.diff_ci_hi:+.3f}]  "
               f"discordant {t.x_only}/{t.y_only}  McNemar p={t.mcnemar_p:.2g}")
-    print(f"\nwrote {out/'stats_rates.csv'} and {out/'stats_tests.csv'}")
+
+    tt, con, bp = template_analysis(df, W, qids)
+    tt.to_csv(out / "stats_template_tests.csv", index=False)
+    con.to_csv(out / "stats_template_interaction.csv", index=False)
+    bp.to_csv(out / "stats_template_by_pair.csv", index=False)
+    print("\nWITHIN-TEMPLATE PAIRED TESTS (McNemar exact, Bonferroni x9; bootstrap over questions)")
+    for _, t in tt.iterrows():
+        print(f"  {t.scope:8s} {t.comparison:18s} {t.flip_x:.3f} vs {t.flip_y:.3f}  discordant {t.x_only}/{t.y_only}  "
+              f"McNemar bonf p={t.mcnemar_p_bonf:.2g}  diff {t.flip_diff:+.3f} [{t.diff_ci_lo:+.3f}, {t.diff_ci_hi:+.3f}] "
+              f"boot p={t.boot_p:.2g}")
+    print("\nTEMPLATE x ROLE INTERACTION: does a role difference change between templates? (Bonferroni x9)")
+    for _, c in con.iterrows():
+        print(f"  {c.comparison:18s} {c.contrast:16s} {c.diff_t1:+.3f} vs {c.diff_t2:+.3f} -> "
+              f"{c.interaction:+.3f} [{c.ci_lo:+.3f}, {c.ci_hi:+.3f}]  bonf p={c.boot_p_bonf:.2g}")
+    print("\nSENIOR - JUNIOR flip difference by template x pair [95% CI]  (is a template's pattern pair-wide?)")
+    tab = bp.assign(cell=bp.apply(lambda r: f"{r.senior_minus_junior:+.3f} [{r.ci_lo:+.2f},{r.ci_hi:+.2f}]", axis=1)) \
+            .pivot(index="pair", columns="template", values="cell")
+    print(tab.to_string())
+    print(f"\nwrote stats_rates.csv, stats_tests.csv, stats_template_tests.csv, "
+          f"stats_template_interaction.csv, stats_template_by_pair.csv in {out}")
 
 
 if __name__ == "__main__":

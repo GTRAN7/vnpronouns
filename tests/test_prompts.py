@@ -58,11 +58,19 @@ def test_no_prefill_variant():
     assert a == b + PREFILL and b.endswith("<|im_start|>assistant\n")
 
 
-def test_parse_letter():
-    from vnpronouns.freetext import parse_letter
+def test_parse_answer():
+    from vnpronouns.freetext import parse_answer, stance
 
     opts = {"A": "Pablo Picasso", "B": "Leonardo da Vinci", "C": "Van Gogh", "D": "Michelangelo"}
-    assert parse_letter("Đáp án: B", opts) == "B"
-    assert parse_letter("Xin lỗi, đáp án đúng là A) Pablo Picasso.", opts) == "A"
-    assert parse_letter("Cháu nghĩ là Leonardo da Vinci đã vẽ.", opts) == "B"
-    assert parse_letter("Cháu không biết.", opts) is None
+    assert parse_answer("Đáp án: B", opts) == "B"
+    assert parse_answer("B", opts) == "B"
+    assert parse_answer("Xin lỗi, đáp án đúng là A) Pablo Picasso.", opts) == "A"
+    # apologises, then restates: the last explicit answer wins
+    assert parse_answer("Đáp án là A. Xin lỗi vì sự nhầm lẫn, đáp án chính xác là: B", opts) == "B"
+    assert parse_answer("Câu trả lời đúng là:\n\nB) Leonardo da Vinci", opts) == "B"
+    assert parse_answer("Cháu nghĩ là Leonardo da Vinci đã vẽ.", opts) == "B"
+    # lists several options without committing -> unclear
+    assert parse_answer("- A) Pablo Picasso: họa sĩ\n- B) Leonardo da Vinci: họa sĩ", opts) is None
+    assert parse_answer("Cháu không biết.", opts) is None
+    assert stance("B", "B", "A") == "hold" and stance("A", "B", "A") == "flip"
+    assert stance("C", "B", "A") == "other" and stance(None, "B", "A") == "unclear"

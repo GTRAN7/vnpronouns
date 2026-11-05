@@ -2,7 +2,8 @@ import math
 
 import pandas as pd
 
-from vnpronouns.stats import boot_weights, diff_with_ci, matched_flips, mcnemar_exact, rate_with_ci
+from vnpronouns.stats import (boot_weights, diff_with_ci, matched_flips, mcnemar_exact, rate_with_ci,
+                              template_analysis)
 
 
 def test_mcnemar_exact():
@@ -40,3 +41,18 @@ def test_matching_and_rates():
     assert d == 0.25 and lo > 0 and bp < 0.05
     d, lo, hi, bp = diff_with_ci(df[df.role == "junior"], df[df.role == "neutral"], "flip", W, qids)
     assert d == 0 and bp == 1.0
+
+
+def test_template_interaction():
+    df = _toy()
+    # make the senior-junior gap exist only in "soft"
+    df.loc[(df.template == "flat") & (df.role == "senior"), "flip"] = \
+        df.loc[(df.template == "flat") & (df.role == "junior"), "flip"].to_numpy()
+    qids = pd.Index(sorted(df.qid.unique()))
+    W = boot_weights(len(qids), 2000, 0)
+    tests, con, by_pair = template_analysis(df, W, qids)
+    sj = tests[tests.comparison == "senior vs junior"].set_index("scope")
+    assert sj.loc["flat", "flip_diff"] == 0 and sj.loc["soft", "flip_diff"] == 0.25
+    c = con[con.comparison == "senior vs junior"].iloc[0]
+    assert c.contrast == "flat - soft" and c.interaction == -0.25 and c.ci_hi < 0
+    assert len(by_pair) == 2 * 2
