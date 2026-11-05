@@ -106,7 +106,7 @@ def flip_corr(proj: torch.Tensor, meta: pd.DataFrame, rows: np.ndarray) -> torch
     """Correlation of projection with P(pushback letter), both demeaned within (qid, template)."""
     m = meta.loc[rows]
     groups = torch.as_tensor(pd.factorize(m.qid + "|" + m.template)[0])
-    p = torch.as_tensor(m.p_push.to_numpy(), dtype=torch.float32)
+    p = torch.as_tensor(m.p_push.to_numpy().copy(), dtype=torch.float32)
     x = proj[torch.as_tensor(rows)]
     n_g = int(groups.max()) + 1
     cnt = torch.zeros(n_g).index_add_(0, groups, torch.ones(len(groups)))
@@ -115,54 +115,21 @@ def flip_corr(proj: torch.Tensor, meta: pd.DataFrame, rows: np.ndarray) -> torch
     return (x * p[:, None]).sum(0) / (x.norm(dim=0) * p.norm()).clamp(min=1e-8)
 
 
-def main() -> None:
-    ap = base_args(__doc__)
-    ap.add_argument("--acts-path", default=None, help="where to save activations.pt (default: run_dir)")
-    ap.add_argument("--tune-frac", type=float, default=0.2, help="share of test questions held for Phase 6 tuning")
-    ap.add_argument("--chunk", type=int, default=1024)
-    args = ap.parse_args()
-    cfg = config_from_args(args)
-    out = cfg.run_dir
-    acts_path = Path(args.acts_path) if args.acts_path else out / "activations.pt"
-    acts_path.parent.mkdir(parents=True, exist_ok=True)
-
-    beh = pd.read_csv(out / "behavior.csv")
-    model, tok = load_model(cfg)
-    qs = [q for q in load_questions(args.questions) if q.qid in set(beh.qid)]
-    table = prompt_table(tok, qs, templates=sorted(beh.template.unique()))
-    cols = ["qid", "condition", "template", "flip", "p_A", "p_B", "p_C", "p_D"]
-    table = table.merge(beh[cols], on=["qid", "condition", "template"]).reset_index(drop=True)
-    table["row"] = table.index
-    table["p_push"] = [r[f"p_{r.pushback}"] for _, r in table.iterrows()]
-    table["family"] = table.template.map(TEMPLATE_FAMILY)
-    n_hidden = model.config.num_hidden_layers + 1
-    acts = torch.empty(len(table), n_hidden, model.config.hidden_size, dtype=torch.float16)
-    print(f"caching activations for {len(table)} prompts -> {tuple(acts.shape)} fp16 "
-          f"({acts.numel() * 2 / 2**30:.1f} GB)")
-    texts = table.text.tolist()
-    for a in range(0, len(texts), args.chunk):
-        print(f"  chunk {a // args.chunk + 1}/{(len(texts) + args.chunk - 1) // args.chunk}", flush=True)
-        acts[a:a + args.chunk] = score_prompts(model, tok, texts[a:a + args.chunk], cfg.batch_size,
-                                               return_hidden=True, progress=True, sort_by_length=True).hidden
-    del model
-    meta = table.drop(columns="text")
-    torch.save({"acts": acts, "meta": meta.to_dict("records")}, acts_path)
-    print(f"  saved activations -> {acts_path}")
-
-    train, test = split_qids(meta.qid.tolist(), cfg.seed)
+def build_vectors(acts: torch.Tensor, meta: pd.DataFrame, seed: int, tune_frac: float):
+    """Train/test/tune split and all senior-junior vectors (see module docstring)."""
+    train, test = split_qids(meta.qid.tolist(), seed)
     shuffled_test = test[:]
-    random.Random(cfg.seed + 1).shuffle(shuffled_test)
-    n_tune = round(len(test) * args.tune_frac)
+    random.Random(seed + 1).shuffle(shuffled_test)
+    n_tune = round(len(test) * tune_frac)
     tune, final = sorted(shuffled_test[:n_tune]), sorted(shuffled_test[n_tune:])
-
     s_tr, j_tr = twin_index(meta, train)
     v = mean_diff(acts, s_tr, j_tr)
-    vectors = {"v": v, "v_shuffled": mean_diff(acts, s_tr, j_tr, shuffle_seed=cfg.seed),
+    vectors = {"v": v, "v_shuffled": mean_diff(acts, s_tr, j_tr, shuffle_seed=seed),
                "v_primary": mean_diff(acts, *twin_index(meta, train, meta.template.isin(PRIMARY_TEMPLATES))),
                "family": {}, "template": {}, "pair": {}, "pair_shuffled": {},
                "train_qids": train, "test_qids": test, "tune_qids": tune, "final_qids": final,
                "n_train_twins": len(s_tr), "hidden_index_note": "i = output of decoder layer i-1"}
-    for f in sorted(set(TEMPLATE_FAMILY.values())):
+    for f in sorted(meta.family.dropna().unique()):
         vectors["family"][f] = mean_diff(acts, *twin_index(meta, train, meta.family == f))
     for t in sorted(meta.template.unique()):
         vectors["template"][t] = mean_diff(acts, *twin_index(meta, train, meta.template == t))
@@ -170,16 +137,20 @@ def main() -> None:
     for i, p in enumerate(PRONOUN_PAIRS):
         sp, jp = twin_index(meta, train, meta.pair == p)
         vectors["pair"][p] = mean_diff(acts, sp, jp)
-        vectors["pair_shuffled"][p] = mean_diff(acts, sp, jp, shuffle_seed=cfg.seed + 10 + i)
+        vectors["pair_shuffled"][p] = mean_diff(acts, sp, jp, shuffle_seed=seed + 10 + i)
         pair_sums[p] = (vectors["pair"][p] * len(sp), len(sp))
-    torch.save(vectors, out / "vectors.pt")
-    print(f"built vectors from {len(s_tr)} train twins ({len(train)} train questions); "
-          f"test {len(test)} = tune {len(tune)} + final {len(final)} -> {out / 'vectors.pt'}")
+    return vectors, pair_sums
 
+
+def sanity_report(acts: torch.Tensor, meta: pd.DataFrame, vectors: dict, pair_sums: dict, seed: int,
+                  out: Path) -> pd.DataFrame:
+    """The SPEC sanity checks on the test half; writes CSVs + projections.pt and prints a table."""
+    v, test = vectors["v"], vectors["test_qids"]
+    n_hidden = v.shape[0]
     # ---- sanity checks on the test half ----
     s_te, j_te = twin_index(meta, test)
     test_rows = meta[meta.qid.isin(set(test))].row.to_numpy()
-    g = torch.Generator().manual_seed(cfg.seed)
+    g = torch.Generator().manual_seed(seed)
     v_rand = torch.randn(v.shape, generator=g)
     proj_v = project(acts, v)
     torch.save({"proj": proj_v.half(), "meta": meta.to_dict("records")}, out / "projections.pt")
@@ -225,11 +196,12 @@ def main() -> None:
     lay["pair_cos"] = lay.pair_cos.fillna(lay.pop("pair_cos_s"))
     lay.to_csv(out / "sanity_layers.csv", index=False)
 
-    fam = cos(vectors["family"]["hedged"], vectors["family"]["blunt"])
+    fams = vectors["family"]
+    fam = cos(fams["hedged"], fams["blunt"]) if {"hedged", "blunt"} <= set(fams) else torch.full((n_hidden,), float("nan"))
     prim = cos(vectors["v_primary"], v)
     tmpl = list(vectors["template"])
-    tcos = torch.stack([cos(vectors["template"][a], vectors["template"][b])
-                        for i, a in enumerate(tmpl) for b in tmpl[i + 1:]]).mean(0)
+    tpairs = [cos(vectors["template"][a], vectors["template"][b]) for i, a in enumerate(tmpl) for b in tmpl[i + 1:]]
+    tcos = torch.stack(tpairs).mean(0) if tpairs else torch.full((n_hidden,), float("nan"))
 
     pd.set_option("display.width", 220)
     print(f"\nSANITY CHECKS on {len(s_te)} test twins ({len(test)} questions), per hidden index "
@@ -241,21 +213,64 @@ def main() -> None:
     print(hdr)
     L = {k: lay[lay.vector == k].set_index("hidden_idx") for k in kinds}
     for i in range(n_hidden):
-        D, S, R = L["deference"].loc[i], L["shuffled"].loc[i], L["random"].loc[i]
-        print(f"  {i:3d} {D.norm:6.2f} | {D.sep:5.2f} {S.sep:5.2f} {R.sep:5.2f} | {D.dprime:6.2f} | "
-              f"{D.between:5.2f} {S.between:5.2f} {R.between:5.2f} | {D.pair_cos:7.2f} {S.pair_cos:7.2f} "
-              f"{D.cos_oc_ae:7.2f} | {D.loo_sep:5.2f} {D.loo_sep_min:6.2f} | {float(fam[i]):7.2f} {float(tcos[i]):8.2f} | "
-              f"{D.flip_corr:10.3f} {S.flip_corr:6.3f} {R.flip_corr:6.3f}")
-    print(f"\n  cos(v_primary, v) at idx 8/16/24: {float(prim[8]):.2f} / {float(prim[16]):.2f} / {float(prim[24]):.2f}")
+        D, S, R = (L[k].loc[i].to_dict() for k in ("deference", "shuffled", "random"))
+        print(f"  {i:3d} {D['norm']:6.2f} | {D['sep']:5.2f} {S['sep']:5.2f} {R['sep']:5.2f} | {D['dprime']:6.2f} | "
+              f"{D['between']:5.2f} {S['between']:5.2f} {R['between']:5.2f} | {D['pair_cos']:7.2f} {S['pair_cos']:7.2f} "
+              f"{D['cos_oc_ae']:7.2f} | {D['loo_sep']:5.2f} {D['loo_sep_min']:6.2f} | {float(fam[i]):7.2f} {float(tcos[i]):8.2f} | "
+              f"{D['flip_corr']:10.3f} {S['flip_corr']:6.3f} {R['flip_corr']:6.3f}")
+    sel = sorted({i for i in (4, 8, 12, 16, 20, 24, n_hidden - 1) if i < n_hidden})
+    print("\n  cos(v_primary, v): " + "  ".join(f"idx {i}: {float(prim[i]):.2f}" for i in sel))
     print("\n  mean projection on v by role (test prompts, demeaned within question x template), selected layers:")
     m = meta.loc[test_rows]
-    for i in (4, 8, 12, 16, 20, 24, n_hidden - 1):
+    for i in sel:
         x = proj_v[torch.as_tensor(test_rows), i].numpy()
         x = x - pd.Series(x).groupby([m.qid.to_numpy(), m.template.to_numpy()]).transform("mean").to_numpy()
         r = pd.Series(x).groupby(m.role.to_numpy()).mean()
-        print(f"    idx {i:2d}: senior {r['senior']:+.3f}  neutral {r['neutral']:+.3f}  junior {r['junior']:+.3f}")
+        print(f"    idx {i:2d}: " + "  ".join(f"{k} {r.get(k, float('nan')):+.3f}" for k in ("senior", "neutral", "junior")))
     print(f"\nwrote vectors.pt, projections.pt, sanity_layers.csv, sanity_pair_cosine.csv in {out}")
+    return lay
 
+
+def main() -> None:
+    ap = base_args(__doc__)
+    ap.add_argument("--acts-path", default=None, help="where to save activations.pt (default: run_dir)")
+    ap.add_argument("--tune-frac", type=float, default=0.2, help="share of test questions held for Phase 6 tuning")
+    ap.add_argument("--chunk", type=int, default=1024)
+    args = ap.parse_args()
+    cfg = config_from_args(args)
+    out = cfg.run_dir
+    acts_path = Path(args.acts_path) if args.acts_path else out / "activations.pt"
+    acts_path.parent.mkdir(parents=True, exist_ok=True)
+
+    beh = pd.read_csv(out / "behavior.csv")
+    model, tok = load_model(cfg)
+    qs = [q for q in load_questions(args.questions) if q.qid in set(beh.qid)]
+    table = prompt_table(tok, qs, templates=sorted(beh.template.unique()))
+    cols = ["qid", "condition", "template", "flip", "p_A", "p_B", "p_C", "p_D"]
+    table = table.merge(beh[cols], on=["qid", "condition", "template"]).reset_index(drop=True)
+    table["row"] = table.index
+    table["p_push"] = [r[f"p_{r.pushback}"] for _, r in table.iterrows()]
+    table["family"] = table.template.map(TEMPLATE_FAMILY)
+    n_hidden = model.config.num_hidden_layers + 1
+    acts = torch.empty(len(table), n_hidden, model.config.hidden_size, dtype=torch.float16)
+    print(f"caching activations for {len(table)} prompts -> {tuple(acts.shape)} fp16 "
+          f"({acts.numel() * 2 / 2**30:.1f} GB)")
+    texts = table.text.tolist()
+    for a in range(0, len(texts), args.chunk):
+        print(f"  chunk {a // args.chunk + 1}/{(len(texts) + args.chunk - 1) // args.chunk}", flush=True)
+        acts[a:a + args.chunk] = score_prompts(model, tok, texts[a:a + args.chunk], cfg.batch_size,
+                                               return_hidden=True, progress=True, sort_by_length=True).hidden
+    del model
+    meta = table.drop(columns="text")
+    torch.save({"acts": acts, "meta": meta.to_dict("records")}, acts_path)
+    print(f"  saved activations -> {acts_path}")
+
+    vectors, pair_sums = build_vectors(acts, meta, cfg.seed, args.tune_frac)
+    torch.save(vectors, out / "vectors.pt")
+    print(f"built vectors from {vectors['n_train_twins']} train twins ({len(vectors['train_qids'])} train questions); "
+          f"test {len(vectors['test_qids'])} = tune {len(vectors['tune_qids'])} + final {len(vectors['final_qids'])} "
+          f"-> {out / 'vectors.pt'}")
+    sanity_report(acts, meta, vectors, pair_sums, cfg.seed, out)
 
 if __name__ == "__main__":
     main()

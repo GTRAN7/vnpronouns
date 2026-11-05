@@ -46,3 +46,21 @@ def test_planted_direction_is_recovered():
     # mask: one pair only
     sp, jp = twin_index(meta, train, meta.pair == "anh_em")
     assert len(sp) == 10 * 2 and set(meta.loc[sp].pair) == {"anh_em"}
+
+
+def test_build_vectors_and_sanity_report_end_to_end(tmp_path, capsys):
+    from vnpronouns.extract import build_vectors, sanity_report
+    from vnpronouns.prompts import TEMPLATE_FAMILY
+
+    acts, meta, u = _synthetic(n_q=30, layers=5)
+    meta["family"] = meta.template.map(TEMPLATE_FAMILY)
+    vectors, pair_sums = build_vectors(acts, meta, seed=0, tune_frac=0.2)
+    assert set(vectors["tune_qids"]) | set(vectors["final_qids"]) == set(vectors["test_qids"])
+    assert not set(vectors["tune_qids"]) & set(vectors["final_qids"])
+    assert set(vectors["family"]) == {"hedged", "blunt"} and set(vectors["template"]) == {"flat", "soft"}
+    lay = sanity_report(acts, meta, vectors, pair_sums, seed=0, out=tmp_path)
+    d = lay[lay.vector == "deference"]
+    assert (d.sep == 1).all() and (d.loo_sep > 0.95).all() and (d.pair_cos > 0.9).all()
+    assert (tmp_path / "sanity_layers.csv").exists() and (tmp_path / "projections.pt").exists()
+    printed = capsys.readouterr().out
+    assert "SANITY CHECKS" in printed and "mean projection on v by role" in printed
