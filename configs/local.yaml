@@ -1,0 +1,6 @@
+# Local debugging on the Mac.
+model_name: Qwen/Qwen2.5-0.5B-Instruct
+device: auto          # auto -> cuda > mps > cpu
+dtype: float32        # float32 | float16 | bfloat16
+load_in_8bit: false
+output_dir: outputs

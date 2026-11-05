@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnpronouns"
+version = "0.1.0"
+description = "Vietnamese pronoun deference experiment on Qwen 2.5"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.43",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+eightbit = ["bitsandbytes>=0.43", "accelerate>=0.30"]
+
+[tool.setuptools]
+packages = ["vnpronouns"]
