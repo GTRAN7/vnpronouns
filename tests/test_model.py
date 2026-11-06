@@ -118,3 +118,19 @@ def test_ablation_removes_direction(tiny):
                          steering=[Steering(0, v * 0.01, 1.0, "ablate"), Steering(2, v, 1.0, "ablate")])
     torch.testing.assert_close(abl.probs, abl1.probs, atol=1e-5, rtol=1e-4)
     assert not torch.allclose(abl.probs, none.probs)
+
+
+def test_steered_generation_is_batch_invariant(tiny):
+    from vnpronouns.freetext import generate
+
+    model, tok, table = tiny
+    texts, starts = table.text.tolist(), table.pushback_tok.tolist()
+    v = torch.randn(64) * 20
+    plain = generate(model, tok, texts, 4, 6)
+    st = Steering(1, v, 3.0)
+    on_b = generate(model, tok, texts, 4, 6, steering=st, steer_starts=starts)
+    on_1 = generate(model, tok, texts, 1, 6, steering=st, steer_starts=starts)
+    assert on_b == on_1 and on_b != plain
+    abl = generate(model, tok, texts, 4, 6, steering=[Steering(l, v, 1.0, "ablate") for l in range(3)],
+                   steer_starts=starts)
+    assert len(abl) == len(texts)

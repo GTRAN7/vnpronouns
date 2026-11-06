@@ -83,11 +83,24 @@ def has_word(text: str, word: str) -> bool:
 
 @torch.no_grad()
 def generate(model, tok, texts: list[str], batch_size: int, max_new_tokens: int,
-             cache_path: Path | None = None, chunk_size: int = 512) -> list[str]:
-    """Greedy replies. With cache_path, finished chunks are checkpointed and a re-run resumes."""
+             cache_path: Path | None = None, chunk_size: int = 512, steering=None,
+             steer_starts: list[int] | None = None) -> list[str]:
+    """Greedy replies. With cache_path, finished chunks are checkpointed and a re-run resumes.
+    steering (a Steering or list, see model.py) edits from steer_starts[i] on, including every generated token."""
     from tqdm.auto import tqdm
 
-    key = hashlib.sha1(("\x00".join(texts) + f"|{max_new_tokens}").encode()).hexdigest()
+    from vnpronouns.model import _steering_hook
+
+    if steering is not None and steer_starts is None:
+        raise ValueError("steer_starts is required with steering")
+    state: dict = {}
+
+    h = hashlib.sha1(("\x00".join(texts) + f"|{max_new_tokens}").encode())
+    if steering is not None:
+        for st in (steering if isinstance(steering, (list, tuple)) else [steering]):
+            h.update(f"{st.layer}|{st.lam}|{st.mode}|".encode() + st.vector.float().numpy().tobytes())
+        h.update(repr(steer_starts).encode())
+    key = h.hexdigest()
     done: list[str] = []
     if cache_path is not None and cache_path.exists():
         prev = torch.load(cache_path, weights_only=False)
@@ -101,8 +114,14 @@ def generate(model, tok, texts: list[str], batch_size: int, max_new_tokens: int,
         for b in tqdm(range(0, len(chunk), batch_size), leave=False):
             enc = tok(chunk[b:b + batch_size], return_tensors="pt", padding=True,
                       add_special_tokens=False).to(device)
-            gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                                 temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
+            if steering is not None:
+                attn = enc["attention_mask"]
+                pad = attn.shape[1] - attn.sum(-1)
+                start = pad + torch.tensor(steer_starts[c + b:c + b + batch_size], device=device)
+                state["mask"] = torch.arange(attn.shape[1], device=device)[None, :] >= start[:, None]
+            with _steering_hook(model, steering, state):
+                gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                                     temperature=None, top_p=None, top_k=None, pad_token_id=tok.pad_token_id)
             done += [o.strip() for o in
                      tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)]
         if cache_path is not None:

@@ -106,7 +106,9 @@ def first_turn_table(tok, qs) -> pd.DataFrame:
 
 def main() -> None:
     ap = base_args(__doc__)
-    ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train"])
+    ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train", "all"],
+                    help="'all' = every question in the questions file, incl. ones dropped by the baseline filter "
+                         "(only with --first-turn: H3 without the ceiling)")
     ap.add_argument("--layers", nargs="+", required=True, help="decoder layer indices (0-based), or 'all' (ablate)")
     ap.add_argument("--lams", type=float, nargs="+", default=[-2, -1, -0.5, 0.5, 1, 2])
     ap.add_argument("--vectors", nargs="+", default=["deference"], choices=["deference", "random", "shuffled"])
@@ -122,7 +124,12 @@ def main() -> None:
     out = cfg.run_dir
     vectors = torch.load(out / "vectors.pt", weights_only=False)
     beh = pd.read_csv(out / "behavior.csv", usecols=["qid", "template"])
-    qids = set(vectors[f"{args.split}_qids"])
+    if args.split == "all":
+        if not args.first_turn:
+            raise SystemExit("--split all is only for --first-turn")
+        qids = {q.qid for q in load_questions(args.questions)}
+    else:
+        qids = set(vectors[f"{args.split}_qids"])
     args.layers = [layer_spec(l) for l in args.layers]
     if args.mode == "add" and (args.positions != "pushback" or any(not isinstance(l, int) or l < 0 for l in args.layers)):
         raise SystemExit("--positions all / --layers all / layer ranges are only for --mode ablate")

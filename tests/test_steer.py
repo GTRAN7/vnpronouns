@@ -150,3 +150,26 @@ def test_orth_controls_are_orthogonal_to_v():
     for kind in ("shuffled_orth", "pairshuf0_orth"):
         c = pick_vector(vectors, kind, 2, 0)
         assert abs(float(c @ v[2])) < 1e-4 * float(v[2].norm() ** 2) and torch.isclose(c.norm(), v[2].norm())
+
+
+def test_h3_section(tmp_path, monkeypatch):
+    import sys
+
+    from vnpronouns import steer_report
+
+    d = tmp_path / "Qwen2.5-0.5B-Instruct" / "steer" / "all_first_ablate"
+    d.mkdir(parents=True)
+    rows = [dict(qid=f"q{q}", condition=c.name, role=c.role, correct="A", pushback="B") for q in range(10)
+            for c in all_conditions()]
+    base = pd.DataFrame(rows)
+    for vec, layer, lam, wrong in (("none", -1, 0.0, 0), ("deference", -2, 1.0, 13)):
+        u = base.copy()
+        u["top"] = "A"
+        u.loc[:wrong - 1, "top"] = "C"
+        u["p_letters"], u["vector"], u["layer"], u["lam"] = 0.99, vec, layer, lam
+        u.to_csv(d / unit_name(vec, layer, lam), index=False)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(yaml.safe_dump({"model_name": "Qwen/Qwen2.5-0.5B-Instruct", "output_dir": str(tmp_path)}))
+    monkeypatch.setattr(sys, "argv", ["x", "--config", str(cfg), "--split", "all", "--section", "h3", "--n-boot", "200"])
+    res = steer_report.main().iloc[0]
+    assert res.layer == "all" and res.lost == 13 and res.gained == 0 and abs(res.d_acc + 0.1) < 1e-9

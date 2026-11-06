@@ -76,9 +76,9 @@ def paired(df: pd.DataFrame, base: pd.DataFrame, W, qids, metric_cols=("flip", "
 
 def main() -> None:
     ap = base_args(__doc__)
-    ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train"])
+    ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train", "all"])
     ap.add_argument("--n-boot", type=int, default=5000)
-    ap.add_argument("--section", default="main", choices=["main", "null", "ablate"])
+    ap.add_argument("--section", default="main", choices=["main", "null", "ablate", "h3"])
     args = ap.parse_args()
     cfg = config_from_args(args)
     out = cfg.run_dir
@@ -87,6 +87,8 @@ def main() -> None:
         return null_report(sdir / args.split, args, cfg)
     if args.section == "ablate":
         return ablate_report(sdir, args, cfg, out)
+    if args.section == "h3":
+        return h3_report(sdir, args, cfg, out)
     df = load_units(sdir / args.split)
     base = df[df.lam == 0]
     steered = df[df.lam != 0]
@@ -309,6 +311,40 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
             print(msg)
     res.to_csv(out / f"steer_ablate_{args.split}.csv", index=False)
     print(f"\nwrote {out / f'steer_ablate_{args.split}.csv'}")
+    return res
+
+
+def h3_report(sdir, args, cfg, out) -> pd.DataFrame:
+    """First-turn accuracy and P(A-D) under each steering / ablation unit vs unsteered (paired by prompt)."""
+    dirs = sorted(d for d in sdir.glob(f"{args.split}_first*") if any(d.glob("*.csv")))
+    if not dirs:
+        raise SystemExit(f"no first-turn units under {sdir}")
+    rows = []
+    for d in dirs:
+        df = load_units(d)
+        df["acc"] = (df.top == df.correct).astype(float)
+        df["layer"] = df.layer.astype(str).str.replace(r"\.0$", "", regex=True).replace({"-2": "all"})
+        base = df[df.lam == 0]
+        qids = pd.Index(sorted(df.qid.unique()))
+        W = boot_weights(len(qids), args.n_boot, cfg.seed)
+        b = base[["qid", "condition", "acc", "p_letters"]].rename(columns={"acc": "acc_0", "p_letters": "pl_0"})
+        mode = "ablate" if d.name.endswith("ablate") else "add"
+        print(f"\nH3 ({d.name}, {mode}): {len(qids)} questions, {len(base)} prompts; unsteered accuracy "
+              f"{base.acc.mean():.4f}, P(A-D) {base.p_letters.mean():.4f}")
+        for (vec, layer, lam), u in df[df.lam != 0].groupby(["vector", "layer", "lam"]):
+            u = u.merge(b, on=["qid", "condition"])
+            u = u.assign(d_acc=u.acc - u.acc_0)
+            pt, lo, hi = rate_with_ci(u, "d_acc", W, qids)
+            gained, lost = int(((u.acc > 0) & (u.acc_0 == 0)).sum()), int(((u.acc == 0) & (u.acc_0 > 0)).sum())
+            r = dict(units=d.name, mode=mode, vector=vec, layer=layer, lam=lam, accuracy=u.acc.mean(), d_acc=pt,
+                     d_acc_lo=lo, d_acc_hi=hi, gained=gained, lost=lost, mcnemar_p=mcnemar_exact(gained, lost),
+                     p_letters=u.p_letters.mean())
+            rows.append(r)
+            print(f"  {vec:9s} L{layer!s:6s} lam {lam:+4g}  accuracy {r['accuracy']:.4f} ({pt:+.4f} [{lo:+.4f},{hi:+.4f}]; "
+                  f"{gained} gained / {lost} lost, McNemar p={r['mcnemar_p']:.2g})  P(A-D) {r['p_letters']:.4f}")
+    res = pd.DataFrame(rows)
+    res.to_csv(out / f"steer_h3_{args.split}.csv", index=False)
+    print(f"\nwrote {out / f'steer_h3_{args.split}.csv'}")
     return res
 
 

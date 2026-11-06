@@ -100,7 +100,10 @@ def _steering_hook(model, steering, state: dict):
     def make_hook(st: Steering):
         def hook(_module, _args, output):
             h = output[0] if isinstance(output, tuple) else output
-            mask = state["mask"].to(h.dtype)[..., None]
+            mask = state["mask"]
+            if mask.shape[1] != h.shape[1]:   # incremental decoding (generate): new tokens are past the start
+                mask = torch.ones(h.shape[:2], dtype=torch.bool, device=h.device)
+            mask = mask.to(device=h.device, dtype=h.dtype)[..., None]
             if st.mode == "ablate":
                 u = (st.vector.float() / st.vector.float().norm().clamp(min=1e-8)).to(h.device)
                 proj = (h.float() @ u)[..., None]
