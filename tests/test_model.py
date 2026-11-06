@@ -84,3 +84,37 @@ def test_sort_by_length_preserves_order(tiny):
     b = score_prompts(model, tok, texts, 3, return_hidden=True, steering=st, steer_starts=starts, sort_by_length=True)
     torch.testing.assert_close(a.probs, b.probs, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(a.hidden.float(), b.hidden.float(), atol=2e-2, rtol=1e-2)
+
+
+def test_ablation_removes_direction(tiny):
+    from vnpronouns.model import decoder_layers
+
+    model, tok, table = tiny
+    texts = table.text.tolist()
+    starts = [0] * len(texts)
+    v = torch.randn(64) * 5
+    u = v / v.norm()
+    seen = []
+
+    def grab(_m, args, kwargs):   # what decoder layer 1 actually receives (= layer 0 output after edits)
+        h = args[0] if args else kwargs["hidden_states"]
+        seen.append((h.float() @ u).abs().max())
+
+    hd = decoder_layers(model)[1].register_forward_pre_hook(grab, with_kwargs=True)
+    try:
+        # one prompt, so no pad positions (those are left unedited on purpose)
+        score_prompts(model, tok, texts[:1], 1)
+        score_prompts(model, tok, texts[:1], 1, steer_starts=[0],
+                      steering=[Steering(0, v, 1.0, "ablate"), Steering(2, v, 1.0, "ablate")])
+    finally:
+        hd.remove()
+    before, after = seen
+    assert after < 0.01 * before                                    # v component gone from the layer-0 output
+    none = score_prompts(model, tok, texts, len(texts))
+    abl = score_prompts(model, tok, texts, len(texts), steer_starts=starts,
+                        steering=[Steering(0, v, 1.0, "ablate"), Steering(2, v, 1.0, "ablate")])
+    # ablation does not depend on |v|, and batching / padding does not change it
+    abl1 = score_prompts(model, tok, texts, 1, steer_starts=starts,
+                         steering=[Steering(0, v * 0.01, 1.0, "ablate"), Steering(2, v, 1.0, "ablate")])
+    torch.testing.assert_close(abl.probs, abl1.probs, atol=1e-5, rtol=1e-4)
+    assert not torch.allclose(abl.probs, none.probs)

@@ -70,10 +70,16 @@ def char_to_token_index(tok, text: str, char_pos: int) -> int:
 
 @dataclass
 class Steering:
-    """Edit h <- h - lam * vector at the output of decoder layer `layer`, for token positions >= start."""
+    """Edit the output of decoder layer `layer` at token positions >= start.
+
+    mode "add":    h <- h - lam * vector
+    mode "ablate": h <- h - (h . u) u with u = vector / |vector| (directional ablation; lam only
+                   switches it on, any non-zero value)
+    """
     layer: int
     vector: torch.Tensor  # [hidden]
     lam: float
+    mode: str = "add"
 
 
 @dataclass
@@ -83,28 +89,39 @@ class ScoreResult:
 
 
 @contextmanager
-def _steering_hook(model, steering: Steering | None, state: dict):
-    if steering is None or steering.lam == 0:
+def _steering_hook(model, steering, state: dict):
+    """steering: one Steering, a list of them (e.g. ablation at every layer), or None."""
+    edits = [s for s in (steering if isinstance(steering, (list, tuple)) else [steering])
+             if s is not None and s.lam != 0]
+    if not edits:
         yield
         return
-    layer = decoder_layers(model)[steering.layer]
 
-    def hook(_module, _args, output):
-        h = output[0] if isinstance(output, tuple) else output
-        v = steering.vector.to(device=h.device, dtype=h.dtype)
-        h = h - steering.lam * state["mask"].to(h.dtype)[..., None] * v
-        return (h, *output[1:]) if isinstance(output, tuple) else h
+    def make_hook(st: Steering):
+        def hook(_module, _args, output):
+            h = output[0] if isinstance(output, tuple) else output
+            mask = state["mask"].to(h.dtype)[..., None]
+            if st.mode == "ablate":
+                u = (st.vector.float() / st.vector.float().norm().clamp(min=1e-8)).to(h.device)
+                proj = (h.float() @ u)[..., None]
+                h = h - (mask * proj * u).to(h.dtype)
+            else:
+                h = h - st.lam * mask * st.vector.to(device=h.device, dtype=h.dtype)
+            return (h, *output[1:]) if isinstance(output, tuple) else h
+        return hook
 
-    handle = layer.register_forward_hook(hook)
+    layers = decoder_layers(model)
+    handles = [layers[st.layer].register_forward_hook(make_hook(st)) for st in edits]
     try:
         yield
     finally:
-        handle.remove()
+        for hd in handles:
+            hd.remove()
 
 
 @torch.no_grad()
 def score_prompts(model, tok, texts: list[str], batch_size: int = 16, return_hidden: bool = False,
-                  steering: Steering | None = None, steer_starts: list[int] | None = None,
+                  steering: "Steering | list[Steering] | None" = None, steer_starts: list[int] | None = None,
                   progress: bool = False, sort_by_length: bool = False) -> ScoreResult:
     """Next-token letter probabilities at the end of each prompt (and optionally last-token activations).
 
@@ -161,8 +178,9 @@ def score_prompts_resumable(model, tok, texts: list[str], batch_size: int, cache
     h = hashlib.sha1("\x00".join(texts).encode())
     h.update(repr((steer_starts, sorted((k, v) for k, v in kw.items() if k != "steering"))).encode())
     if kw.get("steering") is not None:
-        st = kw["steering"]
-        h.update(f"{st.layer}|{st.lam}|".encode() + st.vector.float().numpy().tobytes())
+        sts = kw["steering"] if isinstance(kw["steering"], (list, tuple)) else [kw["steering"]]
+        for st in sts:
+            h.update(f"{st.layer}|{st.lam}|{st.mode}|".encode() + st.vector.float().numpy().tobytes())
     key = h.hexdigest()
     done = {"key": key, "probs": [], "hidden": []}
     if cache_path.exists():

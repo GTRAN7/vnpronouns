@@ -18,6 +18,11 @@ def test_pick_vector_controls_have_same_norm():
         assert torch.isclose(c.norm(), v.norm())
         assert abs(float(torch.nn.functional.cosine_similarity(c, v, dim=0))) < 0.9
     assert unit_name("random", 12, 1.0) == "random_L12_lam+1.csv" and unit_name("x", 3, 0) == "none_L-1_lam+0.csv"
+    assert unit_name("deference", -2, 1.0) == "deference_Lall_lam+1.csv"
+    # random == random0 (Phase 6 draw); randomK are independent directions of the same length
+    assert torch.equal(pick_vector(vectors, "random0", 2, 0), pick_vector(vectors, "random", 2, 0))
+    r1, r2 = pick_vector(vectors, "random1", 2, 0), pick_vector(vectors, "random2", 2, 0)
+    assert torch.isclose(r1.norm(), v.norm()) and not torch.allclose(r1, r2)
 
 
 def test_first_turn_table_steers_from_user_turn():
@@ -83,3 +88,43 @@ def test_steer_report_selects_the_effective_layer(tmp_path, monkeypatch, capsys)
     steer_report.main()
     out = capsys.readouterr().out
     assert "PER-TEMPLATE PREDICTION" in out and "DEFERENCE vector" in out
+
+
+def test_null_and_ablate_sections(tmp_path, monkeypatch, capsys):
+    import sys
+
+    from vnpronouns import steer_report
+
+    d = _fake_units(tmp_path, "tune", effect=0.1)
+    base = pd.read_csv(d / "none_L-1_lam+0.csv")
+    for k in range(1, 6):   # extra random directions with small effects
+        u = base.copy()
+        u["p_push"] -= 0.002 * k * (u.role == "senior")
+        u["flip"] = u.p_push > 0.5
+        u["top"] = np.where(u.flip, "B", "A")
+        u["p_letters"], u["vector"], u["layer"], u["lam"] = 0.99, f"random{k}", 12, 1.0
+        u.to_csv(d / unit_name(f"random{k}", 12, 1.0), index=False)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(yaml.safe_dump({"model_name": "Qwen/Qwen2.5-0.5B-Instruct", "output_dir": str(tmp_path)}))
+    monkeypatch.setattr(sys, "argv", ["x", "--config", str(cfg), "--split", "tune", "--section", "null"])
+    res = steer_report.main()
+    r = res[(res.layer == 12) & (res.lam == 1)].iloc[0]
+    assert r.n_random == 6 and r.gap_change_p < 0.2   # deference beats every random direction
+
+    # ablation: deference closes the S-J gap, random does nothing
+    a = d.parent / "tune_ablate_allpos"
+    a.mkdir()
+    base.to_csv(a / "none_L-1_lam+0.csv", index=False)
+    for vec in ("deference", "random", "random1"):
+        u = base.copy()
+        if vec == "deference":
+            u.loc[u.role == "senior", "p_push"] -= 0.2
+        u["flip"] = u.p_push > 0.5
+        u["top"] = np.where(u.flip, "B", "A")
+        u["p_letters"], u["vector"], u["layer"], u["lam"] = 0.99, vec, -2, 1.0
+        u.to_csv(a / unit_name(vec, -2, 1.0), index=False)
+    monkeypatch.setattr(sys, "argv", ["x", "--config", str(cfg), "--split", "tune", "--section", "ablate", "--n-boot", "200"])
+    res = steer_report.main()
+    dd = res.set_index("vector")
+    assert dd.loc["deference", "d_gap_SJ"] < -0.1 and dd.loc["random", "d_gap_SJ"] == 0
+    assert "S-J gap change" in capsys.readouterr().out

@@ -17,6 +17,16 @@ For every (vector, layer, lam) unit vs the unsteered lam = 0 unit, per role:
   steering change should track each template's own senior-junior gap), and H3 from the
   first-turn units (accuracy and P(A-D) mass under steering).
 Writes steer_summary_<split>.csv.
+
+Phase 6b sections (--section; the default "main" is everything above):
+  null    deference vs K independent random directions (random, random1..K) and shuffled, at each
+          layer / lam they were run: is v's effect bigger than a same-length random push?
+          Reports the empirical p = (1 + #{random with |effect| >= |v's|}) / (K + 1) for the shift
+          in mean P(push) over roles and for the change in the senior-junior gap.
+  ablate  directional-ablation units (steer/<split>_ablate*): per role change, and the change in
+          the senior-junior / neutral-junior / senior-neutral flip gaps vs unsteered, with CIs.
+          If v carries the rank information the model uses, ablating it should shrink S-J;
+          ablating random directions should not. Writes steer_ablate_<split>.csv.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from vnpronouns.common import base_args, config_from_args
-from vnpronouns.stats import boot_weights, mcnemar_exact, rate_with_ci
+from vnpronouns.stats import boot_weights, diff_boots, mcnemar_exact, rate_with_ci, summarize_boots
 
 KEY = ["qid", "condition", "template"]
 ROLES = ("senior", "neutral", "junior")
@@ -67,10 +77,15 @@ def main() -> None:
     ap = base_args(__doc__)
     ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train"])
     ap.add_argument("--n-boot", type=int, default=5000)
+    ap.add_argument("--section", default="main", choices=["main", "null", "ablate"])
     args = ap.parse_args()
     cfg = config_from_args(args)
     out = cfg.run_dir
     sdir = out / "steer"
+    if args.section == "null":
+        return null_report(sdir / args.split, args, cfg)
+    if args.section == "ablate":
+        return ablate_report(sdir, args, cfg, out)
     df = load_units(sdir / args.split)
     base = df[df.lam == 0]
     steered = df[df.lam != 0]
@@ -163,6 +178,106 @@ def main() -> None:
                                                        n=("acc", "size"))
         print(t.round(4).to_string())
     print(f"\nwrote {out / f'steer_summary_{args.split}.csv'}")
+
+
+def null_report(unit_dir, args, cfg) -> pd.DataFrame:
+    df = load_units(unit_dir)
+    base, steered = df[df.lam == 0], df[df.lam != 0]
+    qids = pd.Index(sorted(df.qid.unique()))
+    W = boot_weights(len(qids), 200, cfg.seed)   # CIs are not used here, only point estimates
+    summ = pd.DataFrame(paired(steered, base, W, qids))
+    summ = summ[summ.vector.str.match(r"^(deference|shuffled|random\d*)$")]
+    w = summ.pivot_table(index=["vector", "layer", "lam"], columns="role", values="d_p_push")
+    wf = summ.pivot_table(index=["vector", "layer", "lam"], columns="role", values="d_flip")
+    eff = pd.DataFrame({"shift": w[list(ROLES)].mean(axis=1), "gap_change": w["senior"] - w["junior"],
+                        "flip_shift": wf[list(ROLES)].mean(axis=1), "flip_gap_change": wf["senior"] - wf["junior"]})
+    eff = eff.reset_index()
+    print(f"NULL over random directions ({args.split}, {len(qids)} questions). shift = mean change in P(push) over "
+          f"roles; gap_change = change in senior - junior P(push); flip_* = same on flip rate.")
+    rows = []
+    for (layer, lam), g in eff.groupby(["layer", "lam"]):
+        rnd = g[g.vector.str.startswith("random")]
+        d = g[g.vector == "deference"]
+        if d.empty or len(rnd) < 2:
+            continue
+        r = dict(layer=int(layer), lam=lam, n_random=len(rnd))
+        for m in ("shift", "gap_change", "flip_shift", "flip_gap_change"):
+            dv = float(d[m].iloc[0])
+            rv = rnd[m].to_numpy()
+            r.update({f"{m}_v": dv, f"{m}_rand_absmean": np.abs(rv).mean(), f"{m}_rand_absmax": np.abs(rv).max(),
+                      f"{m}_p": (1 + (np.abs(rv) >= abs(dv)).sum()) / (len(rv) + 1)})
+            sh = g[g.vector == "shuffled"]
+            if len(sh):
+                r[f"{m}_shuffled"] = float(sh[m].iloc[0])
+        rows.append(r)
+    res = pd.DataFrame(rows)
+    for _, r in res.iterrows():
+        print(f"\n  L{r.layer} lam {r.lam:+g}  ({r.n_random} random directions)")
+        for m in ("shift", "gap_change", "flip_shift", "flip_gap_change"):
+            sh = f"  shuffled {r[f'{m}_shuffled']:+.4f}" if f"{m}_shuffled" in r and pd.notna(r.get(f"{m}_shuffled")) else ""
+            print(f"    {m:16s} v {r[f'{m}_v']:+.4f}   random |mean| {r[f'{m}_rand_absmean']:.4f} "
+                  f"|max| {r[f'{m}_rand_absmax']:.4f}   p = {r[f'{m}_p']:.3f}{sh}")
+    print("\n  per random direction (shift, gap_change):")
+    print(eff.round(4).to_string(index=False))
+    res.to_csv(cfg.run_dir / f"steer_null_{args.split}.csv", index=False)
+    return res
+
+
+def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
+    dirs = sorted(d for d in sdir.glob(f"{args.split}_ablate*") if any(d.glob("*.csv")))
+    if not dirs:
+        raise SystemExit(f"no ablation units under {sdir}")
+    W = qids = None
+    rows = []
+    gaps = (("senior", "junior"), ("neutral", "junior"), ("senior", "neutral"))
+    for d in dirs:
+        df = load_units(d)
+        base, steered = df[df.lam == 0], df[df.lam != 0]
+        if W is None:
+            qids = pd.Index(sorted(df.qid.unique()))
+            W = boot_weights(len(qids), args.n_boot, cfg.seed)
+        pos = "all tokens" if d.name.endswith("_allpos") else "from pushback"
+        base_gap = {g: diff_boots(base[base.role == g[0]], base[base.role == g[1]], "flip", W, qids) for g in gaps}
+        print(f"\nABLATION ({pos}; {d.name}): unsteered flip "
+              + "  ".join(f"{r} {base[base.role == r].flip.mean():.3f}" for r in ROLES)
+              + "  gaps " + "  ".join(f"{a[0].upper()}-{b[0].upper()} {base_gap[(a, b)][0]:+.3f}" for a, b in gaps))
+        per_role = pd.DataFrame(paired(steered, base, W, qids))
+        for (vec, layer), u in steered.groupby(["vector", "layer"]):
+            r = dict(positions=pos, vector=vec, layer="all" if layer == -2 else int(layer))
+            pr = per_role[(per_role.vector == vec) & (per_role.layer == layer)].set_index("role")
+            for role in ROLES:
+                r[f"flip_{role}"] = pr.loc[role, "flip"]
+                r[f"d_flip_{role}"] = pr.loc[role, "d_flip"]
+            r["p_letters"] = u.p_letters.mean()
+            for a, b in gaps:
+                pt, bt = diff_boots(u[u.role == a], u[u.role == b], "flip", W, qids)
+                p0, b0 = base_gap[(a, b)]
+                ch, lo, hi, p = summarize_boots(pt - p0, bt - b0)
+                k = f"{a[0].upper()}{b[0].upper()}"
+                r.update({f"gap_{k}": pt, f"d_gap_{k}": ch, f"d_gap_{k}_lo": lo, f"d_gap_{k}_hi": hi, f"d_gap_{k}_p": p})
+            rows.append(r)
+            print(f"  {vec:9s} L{r['layer']!s:4s} flip S {r['flip_senior']:.3f} ({r['d_flip_senior']:+.3f})  "
+                  f"N {r['flip_neutral']:.3f} ({r['d_flip_neutral']:+.3f})  J {r['flip_junior']:.3f} ({r['d_flip_junior']:+.3f})"
+                  f"  P(A-D) {r['p_letters']:.3f}")
+            print("            " + "   ".join(
+                f"{k} gap {r[f'gap_{k}']:+.3f} (change {r[f'd_gap_{k}']:+.3f} [{r[f'd_gap_{k}_lo']:+.3f},"
+                f"{r[f'd_gap_{k}_hi']:+.3f}] p={r[f'd_gap_{k}_p']:.2g})" for k in ("SJ", "NJ", "SN")))
+    res = pd.DataFrame(rows)
+    print("\n  S-J gap change: deference vs the random directions, per positions x layer")
+    for (pos, layer), g in res.groupby(["positions", "layer"], sort=False):
+        d, rnd = g[g.vector == "deference"], g[g.vector.str.startswith("random")]
+        if d.empty:
+            continue
+        dv = float(d.d_gap_SJ.iloc[0])
+        msg = f"    {pos:13s} L{layer!s:4s} deference {dv:+.3f}"
+        if len(rnd):
+            rv = rnd.d_gap_SJ.to_numpy()
+            msg += (f"   random ({len(rv)}): mean {rv.mean():+.3f}, range [{rv.min():+.3f},{rv.max():+.3f}]"
+                    f"   p = {(1 + (np.abs(rv) >= abs(dv)).sum()) / (len(rv) + 1):.3f}")
+        print(msg)
+    res.to_csv(out / f"steer_ablate_{args.split}.csv", index=False)
+    print(f"\nwrote {out / f'steer_ablate_{args.split}.csv'}")
+    return res
 
 
 if __name__ == "__main__":

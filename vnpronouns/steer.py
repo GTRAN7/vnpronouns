@@ -16,9 +16,19 @@ steering from the first user turn onward.
 
 Each (vector, layer, lam) is one resumable unit: run_dir/steer/<split>[_first]/<vector>_L<l>_lam<x>.csv
 (lam = 0 is computed once as none_L-1_lam+0.csv). Existing units are skipped.
+
+Phase 6b:
+  --n-random K   adds random1..randomK (independent random directions, same length as v): a null
+                 distribution for the steering effect instead of one random draw.
+  --mode ablate  directional ablation h <- h - (h . u) u (u = unit vector) instead of adding lam * v;
+                 --layers all ablates at every decoder layer; --positions all edits every token, not
+                 just from the pushback turn. Units go to steer/<split>_ablate[_allpos]/ with lam = 1
+                 as a placeholder; layer -2 means "all layers".
 """
 
 from __future__ import annotations
+
+import shutil
 
 import pandas as pd
 import torch
@@ -37,14 +47,20 @@ def pick_vector(vectors: dict, kind: str, hidden_idx: int, seed: int) -> torch.T
     if kind == "shuffled":
         s = vectors["v_shuffled"][hidden_idx].float()
         return s / s.norm().clamp(min=1e-8) * v.norm()
-    if kind == "random":
-        r = torch.randn(v.shape, generator=torch.Generator().manual_seed(seed + hidden_idx))
+    if kind.startswith("random"):
+        k = int(kind[len("random"):] or 0)   # random == random0 (the Phase 6 draw)
+        r = torch.randn(v.shape, generator=torch.Generator().manual_seed(seed + hidden_idx + 7919 * k))
         return r / r.norm() * v.norm()
     raise ValueError(kind)
 
 
+ALL_LAYERS = -2
+
+
 def unit_name(kind: str, layer: int, lam: float) -> str:
-    return "none_L-1_lam+0.csv" if lam == 0 else f"{kind}_L{layer}_lam{lam:+g}.csv"
+    if lam == 0:
+        return "none_L-1_lam+0.csv"
+    return f"{kind}_L{'all' if layer == ALL_LAYERS else layer}_lam{lam:+g}.csv"
 
 
 def first_turn_table(tok, qs) -> pd.DataFrame:
@@ -61,9 +77,12 @@ def first_turn_table(tok, qs) -> pd.DataFrame:
 def main() -> None:
     ap = base_args(__doc__)
     ap.add_argument("--split", default="tune", choices=["tune", "final", "test", "train"])
-    ap.add_argument("--layers", type=int, nargs="+", required=True, help="decoder layer indices (0-based)")
+    ap.add_argument("--layers", nargs="+", required=True, help="decoder layer indices (0-based), or 'all' (ablate)")
     ap.add_argument("--lams", type=float, nargs="+", default=[-2, -1, -0.5, 0.5, 1, 2])
     ap.add_argument("--vectors", nargs="+", default=["deference"], choices=["deference", "random", "shuffled"])
+    ap.add_argument("--n-random", type=int, default=0, help="also run random1..randomK")
+    ap.add_argument("--mode", default="add", choices=["add", "ablate"])
+    ap.add_argument("--positions", default="pushback", choices=["pushback", "all"])
     ap.add_argument("--first-turn", action="store_true")
     args = ap.parse_args()
     cfg = config_from_args(args)
@@ -71,8 +90,19 @@ def main() -> None:
     vectors = torch.load(out / "vectors.pt", weights_only=False)
     beh = pd.read_csv(out / "behavior.csv", usecols=["qid", "template"])
     qids = set(vectors[f"{args.split}_qids"])
-    unit_dir = out / "steer" / (args.split + ("_first" if args.first_turn else ""))
+    if args.mode == "add" and (args.positions != "pushback" or "all" in args.layers):
+        raise SystemExit("--positions all / --layers all are only for --mode ablate")
+    args.layers = [ALL_LAYERS if l == "all" else int(l) for l in args.layers]
+    args.vectors = list(args.vectors) + [f"random{k}" for k in range(1, args.n_random + 1)]
+    sub = args.split + ("_first" if args.first_turn else "")
+    if args.mode == "ablate":
+        sub += "_ablate" + ("_allpos" if args.positions == "all" else "")
+        args.lams = [1.0]
+    unit_dir = out / "steer" / sub
     unit_dir.mkdir(parents=True, exist_ok=True)
+    base_src = out / "steer" / args.split / unit_name("none", -1, 0)
+    if sub != args.split and not args.first_turn and base_src.exists() and not (unit_dir / base_src.name).exists():
+        shutil.copy(base_src, unit_dir / base_src.name)   # the unsteered unit is the same prompts
 
     lams = sorted(set(args.lams) | {0.0})
     todo = [(k, l, x) for x in lams for l in (args.layers if x else [-1]) for k in (args.vectors if x else ["none"])]
@@ -83,7 +113,7 @@ def main() -> None:
         return
     model, tok = load_model(cfg)
     n_layers = len(decoder_layers(model))
-    if not all(0 <= l < n_layers for l in args.layers):
+    if not all(0 <= l < n_layers or l == ALL_LAYERS for l in args.layers):
         raise SystemExit(f"--layers must be in [0, {n_layers - 1}]")
     qs = [q for q in load_questions(args.questions) if q.qid in qids]
     table = (first_turn_table(tok, qs) if args.first_turn
@@ -91,16 +121,21 @@ def main() -> None:
     print(f"  {len(table)} prompts per unit")
 
     for i, (kind, layer, lam) in enumerate(todo):
-        st = None if lam == 0 else Steering(layer, pick_vector(vectors, kind, layer + 1, cfg.seed), lam)
+        if lam == 0:
+            st = None
+        else:
+            ls = range(n_layers) if layer == ALL_LAYERS else [layer]
+            st = [Steering(l, pick_vector(vectors, kind, l + 1, cfg.seed), lam, args.mode) for l in ls]
+        starts = [0] * len(table) if args.positions == "all" else table.pushback_tok.tolist()
         res = score_prompts(model, tok, table.text.tolist(), cfg.batch_size, steering=st,
-                            steer_starts=table.pushback_tok.tolist(), sort_by_length=True)
+                            steer_starts=starts, sort_by_length=True)
         df = add_scores(table.drop(columns=["text", "pushback_tok"]), res.probs)
         df["flip"] = df.top == df.pushback
         df["p_push"] = [r[f"p_{r.pushback}"] for _, r in df.iterrows()]
         df["vector"], df["layer"], df["lam"] = kind, layer, lam
         df.to_csv(unit_dir / unit_name(kind, layer, lam), index=False)
         f = df.groupby("role").flip.mean()
-        print(f"  [{i + 1}/{len(todo)}] {kind:9s} L{layer:<3d} lam {lam:+5.2g}  flip S {f.get('senior', float('nan')):.3f} "
+        print(f"  [{i + 1}/{len(todo)}] {kind:9s} L{layer:<3d} {args.mode} lam {lam:+5.2g}  flip S {f.get('senior', float('nan')):.3f} "
               f"N {f.get('neutral', float('nan')):.3f} J {f.get('junior', float('nan')):.3f}  "
               f"P(A-D) {df.p_letters.mean():.3f}", flush=True)
 
