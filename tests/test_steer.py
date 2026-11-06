@@ -6,7 +6,7 @@ import torch
 import yaml
 
 from vnpronouns.prompts import PUSHBACK_TEMPLATES, all_conditions
-from vnpronouns.steer import first_turn_table, pick_vector, unit_name
+from vnpronouns.steer import ALL_LAYERS, first_turn_table, layer_spec, layers_of, pick_vector, unit_name
 
 
 def test_pick_vector_controls_have_same_norm():
@@ -127,4 +127,16 @@ def test_null_and_ablate_sections(tmp_path, monkeypatch, capsys):
     res = steer_report.main()
     dd = res.set_index("vector")
     assert dd.loc["deference", "d_gap_SJ"] < -0.1 and dd.loc["random", "d_gap_SJ"] == 0
-    assert "S-J gap change" in capsys.readouterr().out
+    assert "gap changes: deference vs controls" in capsys.readouterr().out
+
+
+def test_layer_specs_and_pair_shuffled():
+    assert layer_spec("18") == 18 and layer_spec("all") == ALL_LAYERS and layer_spec("10-19") == "10-19"
+    assert layers_of("2-4", 28) == [2, 3, 4] and layers_of(ALL_LAYERS, 3) == [0, 1, 2] and layers_of(5, 28) == [5]
+    assert unit_name("deference", "10-19", 1.0) == "deference_L10-19_lam+1.csv"
+    g = torch.Generator().manual_seed(0)
+    vectors = {"v": torch.randn(5, 32, generator=g), "pair_shuffled": {"a": torch.randn(5, 32, generator=g),
+                                                                       "b": torch.randn(5, 32, generator=g)}}
+    p1 = pick_vector(vectors, "pairshuf1", 3, 0)
+    assert torch.isclose(p1.norm(), vectors["v"][3].norm())
+    assert torch.allclose(p1 / p1.norm(), vectors["pair_shuffled"]["b"][3] / vectors["pair_shuffled"]["b"][3].norm())

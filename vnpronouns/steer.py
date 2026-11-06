@@ -47,6 +47,9 @@ def pick_vector(vectors: dict, kind: str, hidden_idx: int, seed: int) -> torch.T
     if kind == "shuffled":
         s = vectors["v_shuffled"][hidden_idx].float()
         return s / s.norm().clamp(min=1e-8) * v.norm()
+    if kind.startswith("pairshuf"):   # shuffled-label vector built within one pronoun pair (Phase 5)
+        s = list(vectors["pair_shuffled"].values())[int(kind[len("pairshuf"):])][hidden_idx].float()
+        return s / s.norm().clamp(min=1e-8) * v.norm()
     if kind.startswith("random"):
         k = int(kind[len("random"):] or 0)   # random == random0 (the Phase 6 draw)
         r = torch.randn(v.shape, generator=torch.Generator().manual_seed(seed + hidden_idx + 7919 * k))
@@ -57,10 +60,32 @@ def pick_vector(vectors: dict, kind: str, hidden_idx: int, seed: int) -> torch.T
 ALL_LAYERS = -2
 
 
-def unit_name(kind: str, layer: int, lam: float) -> str:
+def unit_name(kind: str, layer, lam: float) -> str:
+    """layer: an int, ALL_LAYERS, or a range label "a-b" (ablation only)."""
     if lam == 0:
         return "none_L-1_lam+0.csv"
     return f"{kind}_L{'all' if layer == ALL_LAYERS else layer}_lam{lam:+g}.csv"
+
+
+def layer_spec(spec: str):
+    """'18' -> 18, 'all' -> ALL_LAYERS, '10-19' -> '10-19' (decoder layers 10..19 inclusive)."""
+    if spec == "all":
+        return ALL_LAYERS
+    if "-" in spec:
+        a, b = map(int, spec.split("-"))
+        if not 0 <= a <= b:
+            raise SystemExit(f"bad layer range {spec}")
+        return f"{a}-{b}"
+    return int(spec)
+
+
+def layers_of(label, n_layers: int) -> list[int]:
+    if label == ALL_LAYERS:
+        return list(range(n_layers))
+    if isinstance(label, str):
+        a, b = map(int, label.split("-"))
+        return list(range(a, b + 1))
+    return [label]
 
 
 def first_turn_table(tok, qs) -> pd.DataFrame:
@@ -81,6 +106,8 @@ def main() -> None:
     ap.add_argument("--lams", type=float, nargs="+", default=[-2, -1, -0.5, 0.5, 1, 2])
     ap.add_argument("--vectors", nargs="+", default=["deference"], choices=["deference", "random", "shuffled"])
     ap.add_argument("--n-random", type=int, default=0, help="also run random1..randomK")
+    ap.add_argument("--random-from", type=int, default=1, help="first K for --n-random (to extend a set)")
+    ap.add_argument("--pair-shuffled", action="store_true", help="also run pairshuf0..5 (per-pair shuffled vectors)")
     ap.add_argument("--mode", default="add", choices=["add", "ablate"])
     ap.add_argument("--positions", default="pushback", choices=["pushback", "all"])
     ap.add_argument("--first-turn", action="store_true")
@@ -90,10 +117,12 @@ def main() -> None:
     vectors = torch.load(out / "vectors.pt", weights_only=False)
     beh = pd.read_csv(out / "behavior.csv", usecols=["qid", "template"])
     qids = set(vectors[f"{args.split}_qids"])
-    if args.mode == "add" and (args.positions != "pushback" or "all" in args.layers):
-        raise SystemExit("--positions all / --layers all are only for --mode ablate")
-    args.layers = [ALL_LAYERS if l == "all" else int(l) for l in args.layers]
-    args.vectors = list(args.vectors) + [f"random{k}" for k in range(1, args.n_random + 1)]
+    args.layers = [layer_spec(l) for l in args.layers]
+    if args.mode == "add" and (args.positions != "pushback" or any(not isinstance(l, int) or l < 0 for l in args.layers)):
+        raise SystemExit("--positions all / --layers all / layer ranges are only for --mode ablate")
+    args.vectors = list(args.vectors) + [f"random{k}" for k in range(args.random_from, args.random_from + args.n_random)]
+    if args.pair_shuffled:
+        args.vectors += [f"pairshuf{k}" for k in range(len(vectors["pair_shuffled"]))]
     sub = args.split + ("_first" if args.first_turn else "")
     if args.mode == "ablate":
         sub += "_ablate" + ("_allpos" if args.positions == "all" else "")
@@ -113,7 +142,7 @@ def main() -> None:
         return
     model, tok = load_model(cfg)
     n_layers = len(decoder_layers(model))
-    if not all(0 <= l < n_layers or l == ALL_LAYERS for l in args.layers):
+    if not all(0 <= l < n_layers for lab in args.layers for l in layers_of(lab, n_layers)):
         raise SystemExit(f"--layers must be in [0, {n_layers - 1}]")
     qs = [q for q in load_questions(args.questions) if q.qid in qids]
     table = (first_turn_table(tok, qs) if args.first_turn
@@ -124,8 +153,8 @@ def main() -> None:
         if lam == 0:
             st = None
         else:
-            ls = range(n_layers) if layer == ALL_LAYERS else [layer]
-            st = [Steering(l, pick_vector(vectors, kind, l + 1, cfg.seed), lam, args.mode) for l in ls]
+            st = [Steering(l, pick_vector(vectors, kind, l + 1, cfg.seed), lam, args.mode)
+                  for l in layers_of(layer, n_layers)]
         starts = [0] * len(table) if args.positions == "all" else table.pushback_tok.tolist()
         res = score_prompts(model, tok, table.text.tolist(), cfg.batch_size, steering=st,
                             steer_starts=starts, sort_by_length=True)
@@ -135,7 +164,7 @@ def main() -> None:
         df["vector"], df["layer"], df["lam"] = kind, layer, lam
         df.to_csv(unit_dir / unit_name(kind, layer, lam), index=False)
         f = df.groupby("role").flip.mean()
-        print(f"  [{i + 1}/{len(todo)}] {kind:9s} L{layer:<3d} {args.mode} lam {lam:+5.2g}  flip S {f.get('senior', float('nan')):.3f} "
+        print(f"  [{i + 1}/{len(todo)}] {kind:9s} L{str(layer):<5s} {args.mode} lam {lam:+5.2g}  flip S {f.get('senior', float('nan')):.3f} "
               f"N {f.get('neutral', float('nan')):.3f} J {f.get('junior', float('nan')):.3f}  "
               f"P(A-D) {df.p_letters.mean():.3f}", flush=True)
 

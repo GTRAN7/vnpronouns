@@ -232,6 +232,7 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
     gaps = (("senior", "junior"), ("neutral", "junior"), ("senior", "neutral"))
     for d in dirs:
         df = load_units(d)
+        df["layer"] = df.layer.astype(str).str.replace(r"\.0$", "", regex=True).replace({"-2": "all"})
         base, steered = df[df.lam == 0], df[df.lam != 0]
         if W is None:
             qids = pd.Index(sorted(df.qid.unique()))
@@ -243,7 +244,7 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
               + "  gaps " + "  ".join(f"{a[0].upper()}-{b[0].upper()} {base_gap[(a, b)][0]:+.3f}" for a, b in gaps))
         per_role = pd.DataFrame(paired(steered, base, W, qids))
         for (vec, layer), u in steered.groupby(["vector", "layer"]):
-            r = dict(positions=pos, vector=vec, layer="all" if layer == -2 else int(layer))
+            r = dict(positions=pos, vector=vec, layer=layer)
             pr = per_role[(per_role.vector == vec) & (per_role.layer == layer)].set_index("role")
             for role in ROLES:
                 r[f"flip_{role}"] = pr.loc[role, "flip"]
@@ -263,18 +264,23 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
                 f"{k} gap {r[f'gap_{k}']:+.3f} (change {r[f'd_gap_{k}']:+.3f} [{r[f'd_gap_{k}_lo']:+.3f},"
                 f"{r[f'd_gap_{k}_hi']:+.3f}] p={r[f'd_gap_{k}_p']:.2g})" for k in ("SJ", "NJ", "SN")))
     res = pd.DataFrame(rows)
-    print("\n  S-J gap change: deference vs the random directions, per positions x layer")
+    print("\n  gap changes: deference vs controls (random = isotropic directions; shuffled = v_shuffled + the 6"
+          " per-pair shuffled vectors, i.e. data-shaped directions with no consistent senior/junior sign)."
+          "  p = (1 + #controls with |change| >= |v's|) / (n + 1)")
     for (pos, layer), g in res.groupby(["positions", "layer"], sort=False):
-        d, rnd = g[g.vector == "deference"], g[g.vector.str.startswith("random")]
+        d = g[g.vector == "deference"]
         if d.empty:
             continue
-        dv = float(d.d_gap_SJ.iloc[0])
-        msg = f"    {pos:13s} L{layer!s:4s} deference {dv:+.3f}"
-        if len(rnd):
-            rv = rnd.d_gap_SJ.to_numpy()
-            msg += (f"   random ({len(rv)}): mean {rv.mean():+.3f}, range [{rv.min():+.3f},{rv.max():+.3f}]"
-                    f"   p = {(1 + (np.abs(rv) >= abs(dv)).sum()) / (len(rv) + 1):.3f}")
-        print(msg)
+        for k in ("SJ", "NJ", "SN"):
+            dv = float(d[f"d_gap_{k}"].iloc[0])
+            msg = f"    {pos:13s} L{layer!s:6s} {k} deference {dv:+.3f}"
+            for name, sel in (("random", g.vector.str.startswith("random")),
+                              ("shuffled", g.vector.str.match(r"^(shuffled|pairshuf\d+)$"))):
+                cv = g[sel][f"d_gap_{k}"].to_numpy()
+                if len(cv):
+                    msg += (f"   {name} ({len(cv)}): range [{cv.min():+.3f},{cv.max():+.3f}]"
+                            f" p = {(1 + (np.abs(cv) >= abs(dv)).sum()) / (len(cv) + 1):.3f}")
+            print(msg)
     res.to_csv(out / f"steer_ablate_{args.split}.csv", index=False)
     print(f"\nwrote {out / f'steer_ablate_{args.split}.csv'}")
     return res
