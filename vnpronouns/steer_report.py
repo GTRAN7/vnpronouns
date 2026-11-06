@@ -35,6 +35,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import torch
 
 from vnpronouns.common import base_args, config_from_args
 from vnpronouns.stats import boot_weights, diff_boots, mcnemar_exact, rate_with_ci, summarize_boots
@@ -223,12 +224,27 @@ def null_report(unit_dir, args, cfg) -> pd.DataFrame:
     return res
 
 
+def overlap_with_v(vectors: dict, kind: str, layer, seed: int) -> float:
+    """Mean cos^2(control, v) over the ablated layers = share of v that ablating the control also removes."""
+    from vnpronouns.steer import layers_of, pick_vector
+
+    n_layers = vectors["v"].shape[0] - 1
+    lab = -2 if layer == "all" else (layer if "-" in str(layer) else int(layer))
+    c2 = []
+    for l in layers_of(lab, n_layers):
+        v, c = vectors["v"][l + 1].float(), pick_vector(vectors, kind, l + 1, seed)
+        c2.append(float((v @ c) ** 2 / (v.norm() ** 2 * c.norm() ** 2).clamp(min=1e-12)))
+    return float(np.mean(c2))
+
+
 def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
     dirs = sorted(d for d in sdir.glob(f"{args.split}_ablate*") if any(d.glob("*.csv")))
     if not dirs:
         raise SystemExit(f"no ablation units under {sdir}")
     W = qids = None
     rows = []
+    vp = sdir.parent / "vectors.pt"
+    vectors = torch.load(vp, weights_only=False) if vp.exists() else None
     gaps = (("senior", "junior"), ("neutral", "junior"), ("senior", "neutral"))
     for d in dirs:
         df = load_units(d)
@@ -245,6 +261,7 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
         per_role = pd.DataFrame(paired(steered, base, W, qids))
         for (vec, layer), u in steered.groupby(["vector", "layer"]):
             r = dict(positions=pos, vector=vec, layer=layer)
+            r["cos2_v"] = overlap_with_v(vectors, vec, layer, cfg.seed) if vectors is not None else float("nan")
             pr = per_role[(per_role.vector == vec) & (per_role.layer == layer)].set_index("role")
             for role in ROLES:
                 r[f"flip_{role}"] = pr.loc[role, "flip"]
@@ -259,11 +276,19 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
             rows.append(r)
             print(f"  {vec:9s} L{r['layer']!s:4s} flip S {r['flip_senior']:.3f} ({r['d_flip_senior']:+.3f})  "
                   f"N {r['flip_neutral']:.3f} ({r['d_flip_neutral']:+.3f})  J {r['flip_junior']:.3f} ({r['d_flip_junior']:+.3f})"
-                  f"  P(A-D) {r['p_letters']:.3f}")
+                  f"  P(A-D) {r['p_letters']:.3f}  cos^2 with v {r['cos2_v']:.3f}")
             print("            " + "   ".join(
                 f"{k} gap {r[f'gap_{k}']:+.3f} (change {r[f'd_gap_{k}']:+.3f} [{r[f'd_gap_{k}_lo']:+.3f},"
                 f"{r[f'd_gap_{k}_hi']:+.3f}] p={r[f'd_gap_{k}_p']:.2g})" for k in ("SJ", "NJ", "SN")))
     res = pd.DataFrame(rows)
+    ctrl = res[res.vector != "deference"]
+    if ctrl.cos2_v.notna().any() and len(ctrl) > 2:
+        print("\n  does a control's effect come from its overlap with v? corr(cos^2 with v, S-J gap change) "
+              "per positions x layer:")
+        for (pos, layer), g in ctrl.groupby(["positions", "layer"], sort=False):
+            if len(g) > 2 and g.cos2_v.std() > 0:
+                print(f"    {pos:13s} L{layer!s:6s} n={len(g):2d}  r = {np.corrcoef(g.cos2_v, g.d_gap_SJ)[0, 1]:+.2f}  "
+                      f"cos^2 range [{g.cos2_v.min():.3f},{g.cos2_v.max():.3f}]")
     print("\n  gap changes: deference vs controls (random = isotropic directions; shuffled = v_shuffled + the 6"
           " per-pair shuffled vectors, i.e. data-shaped directions with no consistent senior/junior sign)."
           "  p = (1 + #controls with |change| >= |v's|) / (n + 1)")
@@ -275,7 +300,8 @@ def ablate_report(sdir, args, cfg, out) -> pd.DataFrame:
             dv = float(d[f"d_gap_{k}"].iloc[0])
             msg = f"    {pos:13s} L{layer!s:6s} {k} deference {dv:+.3f}"
             for name, sel in (("random", g.vector.str.startswith("random")),
-                              ("shuffled", g.vector.str.match(r"^(shuffled|pairshuf\d+)$"))):
+                              ("shuffled", g.vector.str.match(r"^(shuffled|pairshuf\d+)$")),
+                              ("shuffled-orth", g.vector.str.endswith("_orth"))):
                 cv = g[sel][f"d_gap_{k}"].to_numpy()
                 if len(cv):
                     msg += (f"   {name} ({len(cv)}): range [{cv.min():+.3f},{cv.max():+.3f}]"

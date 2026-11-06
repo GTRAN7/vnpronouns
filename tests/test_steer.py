@@ -140,3 +140,13 @@ def test_layer_specs_and_pair_shuffled():
     p1 = pick_vector(vectors, "pairshuf1", 3, 0)
     assert torch.isclose(p1.norm(), vectors["v"][3].norm())
     assert torch.allclose(p1 / p1.norm(), vectors["pair_shuffled"]["b"][3] / vectors["pair_shuffled"]["b"][3].norm())
+
+
+def test_orth_controls_are_orthogonal_to_v():
+    g = torch.Generator().manual_seed(0)
+    v = torch.randn(5, 32, generator=g)
+    vectors = {"v": v, "v_shuffled": v + 0.1 * torch.randn(5, 32, generator=g),
+               "pair_shuffled": {"a": torch.randn(5, 32, generator=g)}}
+    for kind in ("shuffled_orth", "pairshuf0_orth"):
+        c = pick_vector(vectors, kind, 2, 0)
+        assert abs(float(c @ v[2])) < 1e-4 * float(v[2].norm() ** 2) and torch.isclose(c.norm(), v[2].norm())

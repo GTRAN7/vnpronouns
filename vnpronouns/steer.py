@@ -42,6 +42,11 @@ from vnpronouns.run_behavior import add_scores
 
 def pick_vector(vectors: dict, kind: str, hidden_idx: int, seed: int) -> torch.Tensor:
     v = vectors["v"][hidden_idx].float()
+    if kind.endswith("_orth"):   # the control with its v component removed (ablation ignores sign, so overlap matters)
+        c = pick_vector(vectors, kind[:-len("_orth")], hidden_idx, seed)
+        u = v / v.norm().clamp(min=1e-8)
+        c = c - (c @ u) * u
+        return c / c.norm().clamp(min=1e-8) * v.norm()
     if kind == "deference":
         return v
     if kind == "shuffled":
@@ -110,6 +115,7 @@ def main() -> None:
     ap.add_argument("--pair-shuffled", action="store_true", help="also run pairshuf0..5 (per-pair shuffled vectors)")
     ap.add_argument("--mode", default="add", choices=["add", "ablate"])
     ap.add_argument("--positions", default="pushback", choices=["pushback", "all"])
+    ap.add_argument("--orth", action="store_true", help="use shuffled / pair-shuffled controls orthogonalized to v")
     ap.add_argument("--first-turn", action="store_true")
     args = ap.parse_args()
     cfg = config_from_args(args)
@@ -123,6 +129,8 @@ def main() -> None:
     args.vectors = list(args.vectors) + [f"random{k}" for k in range(args.random_from, args.random_from + args.n_random)]
     if args.pair_shuffled:
         args.vectors += [f"pairshuf{k}" for k in range(len(vectors["pair_shuffled"]))]
+    if args.orth:
+        args.vectors = [k + "_orth" if k.startswith(("shuffled", "pairshuf")) else k for k in args.vectors]
     sub = args.split + ("_first" if args.first_turn else "")
     if args.mode == "ablate":
         sub += "_ablate" + ("_allpos" if args.positions == "all" else "")
